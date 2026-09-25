@@ -43,6 +43,18 @@ Panel {
 
   function setPref(name, value) { if (service) service.setSetting(name, value) }
 
+  function setCalendarSidebarCollapsed(value) {
+    if (calendarSidebarCollapsed === value) return
+    calendarSidebarCollapsed = value
+    setPref("calendarSidebarCollapsed", value)
+  }
+
+  function setDaySidebarCollapsed(value) {
+    if (daySidebarCollapsed === value) return
+    daySidebarCollapsed = value
+    setPref("daySidebarCollapsed", value)
+  }
+
   readonly property int weekStartDay: Number(pref("weekStartDay", 0)) || 0
   readonly property string timeFormat: String(pref("timeFormat", "12h"))
   readonly property bool showWeekNumbers: pref("showWeekNumbers", false) === true
@@ -64,6 +76,7 @@ Panel {
   function openEvent(event) {
     if (!event || !event.uid) return
     if (editorDirty) { requestCancel(function () { root.openEvent(event) }); return }
+    setDaySidebarCollapsed(false)
     dayNotice = ""
     cancelEdit()
     viewerSeed = event
@@ -119,11 +132,11 @@ Panel {
   function startNew() {
     if (newEventCalendar === "") return
     if (editorDirty) { requestCancel(function () { root.startNew() }); return }
+    setDaySidebarCollapsed(false)
     dayNotice = ""
     if (viewerOpen) closeEvent()
     settingsOpen = false
     searchOpen = false
-    dayOptionsOpen = false
     var base = Logic.newEvent(selectedKey, todayKey,
                               Qt.formatTime(new Date(), "HH:mm"), newEventCalendar)
     creating = true
@@ -443,15 +456,10 @@ Panel {
     }
   }
 
-  // Whether a long title or address in the day panel wraps or is cut off.
-  readonly property bool wrapEvents: pref("wrapEvents", false) === true
   // The slice of a day both rails run. One window, so the day and the week
   // are narrowed by the same setting rather than each having an opinion.
   readonly property var dayWindow: Logic.dayWindow(
     pref("dayStartHour", 0), pref("dayEndHour", 24))
-  // The gear on the day panel, which offers exactly that one choice.
-  property bool dayOptionsOpen: false
-
   // -1 when the stored format is one the person typed rather than picked.
   readonly property int clockPreset: Logic.clockPresetIndex(clockFormat)
 
@@ -500,11 +508,24 @@ Panel {
   readonly property color hairline: Logic.ensureContrast(
     String(Color.muted), String(Color.popups.background), 3.0)
 
+  property bool calendarSidebarCollapsed:
+    pref("calendarSidebarCollapsed", false) === true
+  property bool daySidebarCollapsed:
+    pref("daySidebarCollapsed", false) === true
+
+  // The calendar takes back the room released by either collapsed sidebar.
+  // The popup keeps one overall width; only the balance among its columns
+  // changes.
+  readonly property int collapsedCalendarGain:
+    (calendarSidebarCollapsed ? sidebarWidth : 0)
+    + (daySidebarCollapsed ? sidebarWidth : 0)
+
   // The month is a fixed width whether or not the week column is showing:
   // the column comes out of the day cells rather than being added beside
   // them, so turning week numbers on narrows the cells by a few pixels
   // instead of widening the whole card and shifting everything in it.
-  readonly property int gridWidth: Style.space(115) * 7
+  readonly property int gridWidth:
+    Style.space(115) * 7 + collapsedCalendarGain
   readonly property int cellWidth: Math.floor((gridWidth - weekColumnWanted) / 7)
   // One height for everything that sits in a day cell. An all-day bar and an
   // appointment are both one line, so a week's rows line up across it instead
@@ -592,6 +613,7 @@ Panel {
     service && service.searchResults ? service.searchResults.length : 0
 
   function openSearch() {
+    setCalendarSidebarCollapsed(false)
     closeSetup()
     settingsOpen = false
     searchOpen = true
@@ -611,6 +633,7 @@ Panel {
   property bool settingsOpen: false
 
   function openSettings() {
+    setCalendarSidebarCollapsed(false)
     closeSetup()
     searchOpen = false
     settingsOpen = true
@@ -748,6 +771,7 @@ Panel {
   }
 
   function openSetup() {
+    setCalendarSidebarCollapsed(false)
     settingsOpen = false
     searchOpen = false
     setupEditing = false
@@ -780,6 +804,7 @@ Panel {
   // The same form, filled in. iCloud passwords cannot be read back from the
   // keyring; Google reconnects through the browser instead.
   function editAccount(account) {
+    setCalendarSidebarCollapsed(false)
     settingsOpen = false
     searchOpen = false
     setupEditing = true
@@ -878,7 +903,10 @@ Panel {
 
   function setView(mode) {
     viewMode = mode
-    if (viewSeeded) setPref("defaultView", Logic.viewKey(mode))
+    // Write immediately, even if the initial status reply is still in flight.
+    // Service.setSetting overlays that optimistic choice onto the reply, so a
+    // fast first click cannot be replaced by the previously stored view.
+    setPref("defaultView", Logic.viewKey(mode))
   }
 
 
@@ -2205,10 +2233,8 @@ Panel {
     id: dayEntry
     property var event: ({})
     property string timeFormat: "12h"
-    // Cut off at the column's edge, or wrapped onto as many lines as it
-    // takes. The time line never wraps: it is eight characters and always
-    // fits, and letting it wrap would only ever be a rendering accident.
-    property bool wrap: false
+    // Titles and addresses always wrap in full. The time line never wraps: it
+    // is short and letting it wrap would only be a rendering accident.
     signal activated()
 
     implicitHeight: entry.implicitHeight
@@ -2271,8 +2297,8 @@ Panel {
 
       Text {
         width: parent.width
-        wrapMode: dayEntry.wrap ? Text.WordWrap : Text.NoWrap
-        elide: dayEntry.wrap ? Text.ElideNone : Text.ElideRight
+        wrapMode: Text.WordWrap
+        elide: Text.ElideNone
         textFormat: Text.PlainText
         // Still collapsed to one logical line first: iCloud writes titles
         // across several, and wrapping is meant to follow the column's width
@@ -2291,8 +2317,8 @@ Panel {
         Text {
           required property string modelData
           width: entry.width
-          wrapMode: dayEntry.wrap ? Text.WordWrap : Text.NoWrap
-          elide: dayEntry.wrap ? Text.ElideNone : Text.ElideRight
+          wrapMode: Text.WordWrap
+          elide: Text.ElideNone
           textFormat: Text.PlainText
           text: modelData
           color: root.subdued
@@ -2313,23 +2339,25 @@ Panel {
   }
 
   // PanelHero indents its labels a fixed distance from its icon slot, and
-  // applies that margin whether or not there is an icon — so a column without
-  // one is pushed in for no reason. Same two lines, same trailing slot, same
-  // type, flush to the column.
+  // applies that margin whether or not there is an icon. This header only
+  // reserves the leading, centre, and trailing slots it is actually given.
   component ColumnHeader: Item {
     id: header
     property string title: ""
     property string meta: ""
+    property Component leadingControl: null
     property Component centerControl: null
     property Component trailingControl: null
 
     width: parent ? parent.width : implicitWidth
-    implicitHeight: Math.max(labels.implicitHeight, centre.implicitHeight,
-                             trailing.implicitHeight)
+    implicitHeight: Math.max(labels.implicitHeight, leading.implicitHeight,
+                             centre.implicitHeight, trailing.implicitHeight)
 
     Column {
       id: labels
       anchors.left: parent.left
+      anchors.leftMargin: leading.item
+        ? leading.width + Style.space(12) : 0
       anchors.right: parent.right
       // Stop short of whichever slot comes first. A centred slot begins at
       // (width - its width) / 2, so the labels must end that far from the
@@ -2364,6 +2392,13 @@ Panel {
         font.letterSpacing: 1.2
         elide: Text.ElideRight
       }
+    }
+
+    Loader {
+      id: leading
+      sourceComponent: header.leadingControl
+      anchors.left: parent.left
+      anchors.verticalCenter: parent.verticalCenter
     }
 
     Loader {
@@ -2567,14 +2602,15 @@ Panel {
       Row {
         id: columns
         spacing: 0
-        width: root.sidebarWidth * 2 + divider.width + dayDivider.width
-               + calendarColumn.width
+        width: sidebar.width + divider.width + calendarColumn.width
+               + dayDivider.width + daySidebar.width
 
         // ------------------------------------------------- calendars panel
 
         Item {
           id: sidebar
-          width: root.sidebarWidth
+          visible: !root.calendarSidebarCollapsed
+          width: visible ? root.sidebarWidth : 0
           // As tall as the month beside it, so the footer can sit on the
           // bottom of the card rather than under the list.
           implicitHeight: calendarColumn.implicitHeight
@@ -2670,109 +2706,121 @@ Panel {
           Column {
             id: calendarList
             width: sidebar.width
-            spacing: Style.spacing.md
+            spacing: Style.spacing.md * 2
 
-          // One identity row per connected account. This keeps Google and
-          // iCloud accounts with the same email distinct and lets settings
-          // scope their calendar switches to the account that owns them.
-          Repeater {
-            model: root.service ? root.service.accounts : []
-
-            Item {
-              required property var modelData
-              width: sidebar.width
-              implicitHeight: Math.max(accountLabels.implicitHeight,
-                                       accountEdit.implicitHeight)
+            // Each identity owns the calendar rows immediately below it.
+            // Stable provider-qualified IDs keep same-address Google and
+            // iCloud accounts in their own groups.
+            Repeater {
+              model: root.service ? root.service.accounts : []
 
               Column {
-                id: accountLabels
-                anchors.left: parent.left
-                anchors.right: accountEdit.left
-                anchors.rightMargin: Style.spacing.md
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: Style.space(2)
+                id: accountGroup
+                required property var modelData
+                readonly property var accountCalendars: Logic.calendarsForAccount(
+                  root.calendars, modelData.id || modelData.user || "",
+                  modelData.user || "")
+                width: sidebar.width
+                spacing: Style.space(4)
 
-                PanelSectionHeader {
+                Item {
                   width: parent.width
-                  elide: Text.ElideRight
-                  text: Logic.accountProviderName(modelData).toUpperCase()
-                  color: root.foreground
+                  implicitHeight: Math.max(accountLabels.implicitHeight,
+                                           accountEdit.implicitHeight)
+
+                  Column {
+                    id: accountLabels
+                    anchors.left: parent.left
+                    anchors.right: accountEdit.left
+                    anchors.rightMargin: Style.spacing.md
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.space(2)
+
+                    PanelSectionHeader {
+                      width: parent.width
+                      elide: Text.ElideRight
+                      text: Logic.accountProviderName(
+                        accountGroup.modelData).toUpperCase()
+                      color: root.foreground
+                    }
+
+                    Text {
+                      width: parent.width
+                      elide: Text.ElideRight
+                      textFormat: Text.PlainText
+                      text: accountGroup.modelData.user || "Connected account"
+                      color: root.subdued
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+
+                  Button {
+                    id: accountEdit
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: root.controlSize
+                    height: root.controlSize
+                    bordered: true
+                    iconText: "\uf013"
+                    tooltipText: "Account settings"
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    onClicked: root.editAccount(accountGroup.modelData)
+                  }
                 }
 
-                Text {
+                Column {
                   width: parent.width
-                  elide: Text.ElideRight
-                  textFormat: Text.PlainText
-                  text: modelData.user || "Connected account"
-                  color: root.subdued
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
-              }
+                  spacing: Style.space(4)
 
-              Button {
-                id: accountEdit
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                width: root.controlSize
-                height: root.controlSize
-                bordered: true
-                iconText: "\uf013"
-                tooltipText: "Account settings"
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                onClicked: root.editAccount(modelData)
+                  Repeater {
+                    model: accountGroup.accountCalendars
+
+                    CalendarRow {
+                      required property var modelData
+                      width: accountGroup.width
+                      entry: modelData
+                      foreground: root.foreground
+                      fontFamily: root.fontFamily
+                      onToggled: if (root.service)
+                        root.service.setCalendarEnabled(modelData.url, !picked)
+                      onSyncRequested: if (root.service)
+                        root.service.syncCalendar(modelData.url)
+                    }
+                  }
+
+                  Text {
+                    visible: accountGroup.accountCalendars.length === 0
+                    width: parent.width
+                    text: "No calendars"
+                    color: root.subdued
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                }
               }
             }
-          }
 
-          Text {
-            visible: !!(root.service && root.service.accounts.length === 0)
-            width: sidebar.width
-            text: "No account"
-            color: root.subdued
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-          }
-
-          Column {
-            width: sidebar.width
-            // Twice omedia's library spacing. Its rows are one list of one
-            // kind of thing; these are separate calendars, each carrying its
-            // own colour, and they read better as distinct bands than as a
-            // block.
-            spacing: Style.space(4)
-
-          Repeater {
-            model: root.calendars
-
-            // omedia's library row: a BorderSurface that fills on hover and
-            // again when selected, a leading glyph, and a label over a quieter
-            // second line that hides when empty.
-            CalendarRow {
-              required property var modelData
+            Text {
+              visible: !!(root.service && root.service.accounts.length === 0)
               width: sidebar.width
-              entry: modelData
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              onToggled: if (root.service)
-                root.service.setCalendarEnabled(modelData.url, !picked)
-              onSyncRequested: if (root.service)
-                root.service.syncCalendar(modelData.url)
+              text: "No account"
+              color: root.subdued
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
             }
-          }
-          }
 
-          Text {
-            visible: root.calendars.length === 0
-            width: sidebar.width
-            wrapMode: Text.WordWrap
-            text: "No calendars yet."
-            color: root.subdued
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-          }
+            Text {
+              visible: root.calendars.length === 0
+              width: sidebar.width
+              wrapMode: Text.WordWrap
+              text: "No calendars yet."
+              color: root.subdued
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
             }
+          }
           }
 
           // Settings take the same space the list does, and are saved as
@@ -2900,7 +2948,6 @@ Panel {
                       width: sidebar.width
                       event: modelData
                       timeFormat: root.timeFormat
-                      wrap: root.wrapEvents
                       onActivated: {
                         root.selectedKey = Logic.dateKey(modelData.start)
                         root.openEvent(modelData)
@@ -4087,7 +4134,8 @@ Panel {
 
         Item {
           id: divider
-          width: root.ruleGap * 2 + 2
+          visible: !root.calendarSidebarCollapsed
+          width: visible ? root.ruleGap * 2 + 2 : 0
           height: calendarColumn.implicitHeight
 
           VRule {
@@ -4120,6 +4168,20 @@ Panel {
               ? Logic.weekdayOfName(root.selectedKey)
               : root.viewMode === "Week" ? root.weekHead.meta
               : String(root.viewYear)
+
+            leadingControl: Component {
+              Button {
+                width: root.controlSize
+                height: root.controlSize
+                bordered: true
+                iconText: "\uf073"
+                tooltipText: root.calendarSidebarCollapsed
+                  ? "Show calendars" : "Hide calendars"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                onClicked: root.setCalendarSidebarCollapsed(!root.calendarSidebarCollapsed)
+              }
+            }
 
             // qs.Ui's ButtonGroup sizes each chip to its own label; omedia
             // sizes a row of buttons off one shared cell width, which is what
@@ -4219,6 +4281,20 @@ Panel {
                   foreground: root.foreground
                   fontFamily: root.fontFamily
                   onClicked: root.startNew()
+                }
+
+                VRule { height: root.controlSize }
+
+                Button {
+                  width: root.controlSize
+                  height: root.controlSize
+                  bordered: true
+                  iconText: "\uf133"
+                  tooltipText: root.daySidebarCollapsed
+                    ? "Show selected day" : "Hide selected day"
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  onClicked: root.setDaySidebarCollapsed(!root.daySidebarCollapsed)
                 }
               }
             }
@@ -5259,7 +5335,8 @@ Panel {
 
         Item {
           id: dayDivider
-          width: root.ruleGap * 2 + 2
+          visible: !root.daySidebarCollapsed
+          width: visible ? root.ruleGap * 2 + 2 : 0
           height: calendarColumn.implicitHeight
 
           VRule {
@@ -5272,7 +5349,8 @@ Panel {
 
         Item {
           id: daySidebar
-          width: root.sidebarWidth
+          visible: !root.daySidebarCollapsed
+          width: visible ? root.sidebarWidth : 0
           // As tall as the month, so the scheduled list has somewhere to go.
           implicitHeight: calendarColumn.implicitHeight
 
@@ -5289,64 +5367,11 @@ Panel {
               width: daySidebar.width
               title: Logic.weekdayOfName(root.selectedKey)
               meta: Logic.formatDayLabel(root.selectedKey)
-
-              trailingControl: Component {
-                Button {
-                  // Nothing to set while the viewer has the column: the one
-                  // choice here is about the list it replaced.
-                  visible: !root.viewerOpen
-                  width: root.controlSize
-                  height: root.controlSize
-                  bordered: true
-                  iconText: "\uf013"
-                  tooltipText: "Day options"
-                  selected: root.dayOptionsOpen
-                  foreground: root.foreground
-                  fontFamily: root.fontFamily
-                  onClicked: root.dayOptionsOpen = !root.dayOptionsOpen
-                }
-              }
             }
 
             Item { width: 1; height: root.ruleGap }
 
             Rule { width: daySidebar.width }
-
-            // One choice, so it is the choice itself under the header rather
-            // than a panel to go and find it in. Folded away until the gear
-            // asks for it, because a list of events is what this column is
-            // for and a control sitting over it permanently is not.
-            Column {
-              width: daySidebar.width
-              spacing: 0
-              visible: root.dayOptionsOpen && !root.viewerOpen
-
-              Item { width: 1; height: root.halfRuleGap }
-
-              Text {
-                width: parent.width
-                textFormat: Text.PlainText
-                text: "Long titles and addresses"
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-              }
-
-              Item { width: 1; height: Style.space(4) }
-
-              Picker {
-                width: parent.width
-                options: Logic.wrapOptions()
-                value: root.wrapEvents ? "true" : "false"
-                onPicked: function (choice) {
-                  root.setPref("wrapEvents", choice === "true")
-                }
-              }
-
-              Item { width: 1; height: root.halfRuleGap }
-
-              Rule { width: daySidebar.width }
-            }
 
             // The day's own lists, which step aside while the viewer has
             // the column. Its own Column so the gaps between them go too.
@@ -5405,7 +5430,6 @@ Panel {
                     width: daySidebar.width
                     event: modelData
                     timeFormat: root.timeFormat
-                    wrap: root.wrapEvents
                     onActivated: root.openEvent(modelData)
                   }
                 }
@@ -6728,7 +6752,6 @@ Panel {
                   width: daySidebar.width
                   event: modelData
                   timeFormat: root.timeFormat
-                  wrap: root.wrapEvents
                   onActivated: root.openEvent(modelData)
                 }
               }

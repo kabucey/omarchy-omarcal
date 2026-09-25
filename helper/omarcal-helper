@@ -19,6 +19,7 @@ has something to parse.
     event      --uid U [--rid R]         one event, every field
     search     --query Q [--limit N]     title/location/description match
     agenda     [--days N]                what is coming up
+    alerts     --from ISO --to ISO        alert occurrences due in a window
     status                               health, last sync, per-calendar errors
     settings   [--set k=v ...]           UI preferences
     watch      [--interval S]            refresh loop, one JSON line per change
@@ -156,12 +157,12 @@ DEFAULT_SETTINGS = {
     "formatAlt": "d MMMM 'W'ww yyyy",
     "verticalFormat": "HH\n—\nmm",
     "verticalFormatAlt": "dd\nMMM\n'W'ww\n''yy",
-    # Whether a long title or address in the day panel wraps or is cut off.
-    "wrapEvents": False,
     # The slice of a day the day and week rails show. The end runs to 24,
     # which is midnight of the next day.
     "dayStartHour": 0,
     "dayEndHour": 24,
+    "calendarSidebarCollapsed": False,
+    "daySidebarCollapsed": False,
     # Suggesting invitees from iCloud Contacts. Off until the person says
     # yes to reading them, in so many words; off again deletes them.
     "contactsEnabled": False,
@@ -1871,6 +1872,168 @@ def events(conn, start: datetime, end: datetime, only: list[str]) -> dict:
         "objects": conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0],
         "range": {"start": start.isoformat(), "end": end.isoformat()},
         "elapsed": round(time.monotonic() - started, 2),
+    }
+
+
+# Imported alert choices top out at a week in Omarcal, but provider-created
+# alarms can be earlier. This is only an SQL prefilter: open-ended series are
+# always included, and a month keeps the frequent poll from parsing the whole
+# cache while leaving ample room beyond every alert this UI can create.
+ALERT_EVENT_HORIZON = timedelta(days=32)
+
+
+def alarm_specs(parsed, comp) -> list[dict]:
+    """The usable triggers on one VEVENT, with their VALARM positions.
+
+    A relative trigger is seconds from DTSTART (or DTEND for RELATED=END).
+    An absolute trigger is one instant, even when it belongs to a recurring
+    master. Keeping the alarm index makes two equal alerts distinct without
+    putting mutable text such as the event title into their delivery IDs.
+    """
+    out = []
+    index = 0
+    alarm = comp.get_first_component(ICal.ComponentKind.VALARM_COMPONENT)
+    while alarm is not None:
+        prop = alarm.get_first_property(ICal.PropertyKind.TRIGGER_PROPERTY)
+        if prop is not None:
+            raw = (prop.get_value_as_string() or "").strip()
+            trigger = prop.get_trigger()
+            duration = trigger.get_duration() if trigger is not None else None
+            moment = trigger.get_time() if trigger is not None else None
+            if moment is not None and not moment.is_null_time():
+                at = absolute_time(parsed, moment)
+                if at is not None:
+                    out.append({"index": index, "raw": raw, "absolute": int(at)})
+            # libical calls P0D/PT0S a null duration. It is still the valid
+            # and common Google spelling for "at the time of the event"; a
+            # null time above distinguishes it from an absolute trigger.
+            elif duration is not None and not duration.is_bad_duration():
+                out.append({
+                    "index": index,
+                    "raw": raw,
+                    "offset": int(duration.as_utc_seconds()),
+                    "relatedEnd": (prop.get_parameter_as_string("RELATED") or "").upper() == "END",
+                })
+        index += 1
+        alarm = comp.get_next_component(ICal.ComponentKind.VALARM_COMPONENT)
+    return out
+
+
+def alert_key(href: str, uid: str, occurrence_start: int,
+              alarm_index: int, alert_at: int) -> str:
+    identity = "\0".join((href, uid, str(occurrence_start),
+                           str(alarm_index), str(alert_at)))
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+
+
+def append_due_alert(out: list, comp, cal: dict, href: str, begin: int,
+                     finish: int, spec: dict, window_start: int,
+                     window_end: int, rid: str = "") -> None:
+    if "absolute" in spec:
+        alert_at = spec["absolute"]
+    else:
+        base = finish if spec.get("relatedEnd") else begin
+        alert_at = base + spec["offset"]
+    if alert_at < window_start or alert_at >= window_end:
+        return
+    event = occurrence(comp, cal, begin, finish,
+                       comp.get_dtstart().is_date(), rid=rid, href=href)
+    event.update({
+        "id": alert_key(href, event["uid"], begin, spec["index"], alert_at),
+        "at": datetime.fromtimestamp(alert_at, timezone.utc).isoformat().replace("+00:00", "Z"),
+        "trigger": spec["raw"],
+    })
+    out.append(event)
+
+
+def component_cancelled(comp) -> bool:
+    return property_text(comp, ICal.PropertyKind.STATUS_PROPERTY).upper() == "CANCELLED"
+
+
+def alerts(conn, start: datetime, end: datetime) -> dict:
+    """Calendar alerts due in [start, end), expanded into real occurrences."""
+    started = time.monotonic()
+    cals = visible_calendars(conn)
+    if not cals:
+        return {"ok": True, "alerts": [], "parsed": 0,
+                "range": {"start": start.isoformat(), "end": end.isoformat()}}
+
+    lower, upper = int(start.timestamp()), int(end.timestamp())
+    scan_lower = int((start - ALERT_EVENT_HORIZON).timestamp())
+    scan_upper = int((end + ALERT_EVENT_HORIZON).timestamp())
+    rows = conn.execute(
+        "SELECT url,calendar,ics FROM objects WHERE "
+        "instr(upper(ics),'BEGIN:VALARM')>0 "
+        "AND (open_ended=1 OR (last_end>=? AND first_start<?)) "
+        f"AND calendar IN ({','.join('?' * len(cals))})",
+        [scan_lower, scan_upper, *cals.keys()],
+    )
+    out = []
+    parsed_count = 0
+    for href, calendar, ics in rows:
+        parsed = parse_ics(ics)
+        if parsed is None:
+            continue
+        parsed_count += 1
+        master, overrides = split_master_overrides(parsed, vevents(parsed))
+        cal = cals.get(calendar, {})
+
+        if master is not None and not component_cancelled(master):
+            specs = alarm_specs(parsed, master)
+            original_begin, original_finish = span_of(parsed, master)
+
+            # Absolute alarms name one instant, not one instant per recurrence.
+            for spec in specs:
+                if "absolute" in spec:
+                    append_due_alert(out, master, cal, href, original_begin,
+                                     original_finish, spec, lower, upper)
+
+            relative = [spec for spec in specs if "offset" in spec]
+            if relative:
+                duration = max(0, original_finish - original_begin)
+                shifts = [spec["offset"] + (duration if spec.get("relatedEnd") else 0)
+                          for spec in relative]
+                occurrence_from = lower - max(shifts)
+                occurrence_to = upper - min(shifts)
+                win_start = ICal.Time.new_from_string(
+                    datetime.fromtimestamp(occurrence_from, timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+                win_end = ICal.Time.new_from_string(
+                    datetime.fromtimestamp(occurrence_to, timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+
+                def collect(_comp, span, _data):
+                    begin, finish = span.get_start(), span.get_end()
+                    if begin in overrides:
+                        return True
+                    for spec in relative:
+                        append_due_alert(out, master, cal, href, begin, finish,
+                                         spec, lower, upper)
+                    return True
+
+                try:
+                    master.foreach_recurrence(win_start, win_end, collect, None)
+                except Exception:
+                    pass
+
+        # An override replaces its master slot and carries its own alarms. Do
+        # not invent inheritance here: a provider can intentionally remove an
+        # alert from one occurrence by omitting its VALARMs.
+        for rid_at, comp in overrides.items():
+            if component_cancelled(comp):
+                continue
+            begin, finish = span_of(parsed, comp)
+            rid = comp.get_recurrenceid()
+            rid_text = rid.as_ical_string() if rid is not None else str(rid_at)
+            for spec in alarm_specs(parsed, comp):
+                append_due_alert(out, comp, cal, href, begin, finish, spec,
+                                 lower, upper, rid_text)
+
+    out.sort(key=lambda item: (item["at"], item["title"], item["id"]))
+    return {
+        "ok": True,
+        "alerts": out,
+        "parsed": parsed_count,
+        "range": {"start": start.isoformat(), "end": end.isoformat()},
+        "elapsed": round(time.monotonic() - started, 3),
     }
 
 
@@ -3830,7 +3993,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("command", choices=[
         "login", "reveal-password", "accounts", "remove-account",
         "calendars", "set-calendar", "forget-calendar", "sync",
-        "events", "event", "search", "agenda", "status", "settings", "watch",
+        "events", "event", "search", "agenda", "alerts", "status", "settings", "watch",
         "contacts", "contacts-sync", "contacts-forget", "places-history", "places",
         "save", "delete", "pick-file", "import-google-client", "zones", "flush", "pending-dismiss",
         "update-check",
@@ -4168,6 +4331,13 @@ def _dispatch_unlocked(conn, args) -> dict:
     if args.command == "agenda":
         start = datetime.now(LOCAL_TZ)
         return events(conn, start, start + timedelta(days=args.days), args.only)
+
+    if args.command == "alerts":
+        start = parse_when(args.start) if args.start else datetime.now(LOCAL_TZ) - timedelta(minutes=2)
+        end = parse_when(args.end) if args.end else datetime.now(LOCAL_TZ)
+        if end <= start:
+            raise Failure("usage", "--to must be later than --from")
+        return alerts(conn, start, end)
 
     if args.command == "update-check":
         return update_check()

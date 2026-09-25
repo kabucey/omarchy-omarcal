@@ -19,6 +19,9 @@ OAuth in the system browser. Provider credentials stay in the desktop keyring.
   instead of splitting a column into stripes.
 - **An event viewer**: when, how it repeats, where, its alerts, organiser,
   invitees, notes and any link it carries.
+- **Desktop notifications** for the alerts attached to synced iCloud and
+  Google events. They use Omarchy's notification history and respect Do Not
+  Disturb; delivered alerts are remembered across shell restarts.
 - **Search** across every synced calendar, grouped by day, newest first.
 - **Several accounts**, each with its own calendars, shown or hidden
   individually and syncable one at a time.

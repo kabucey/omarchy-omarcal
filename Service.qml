@@ -245,7 +245,8 @@ QtObject {
     printErrors: false
     onLoaded: {
       try {
-        root.installedVersion = String(JSON.parse(text()).version || "")
+        var parsed = JSON.parse(text() || "{}")
+        root.installedVersion = String(parsed && parsed.version || "")
       } catch (e) {
         root.installedVersion = ""
       }
@@ -885,6 +886,8 @@ QtObject {
         root.cacheBytes = payload.cacheBytes || 0
         root.objectCount = payload.objects || 0
         root.settingsLoaded = true
+        if (!root.alertCursor)
+          Qt.callLater(function() { root.pollAlerts() })
       }
       if (root.statusRefreshQueued) {
         root.statusRefreshQueued = false
@@ -944,6 +947,98 @@ QtObject {
         root.syncContacts()
       }
     }
+  }
+
+  // --------------------------------------------------------- notifications
+  //
+  // Providers store event reminders as VALARMs in the same CalDAV objects
+  // the helper already caches. The panel is lazy, so the headless service
+  // owns the poll and hands due occurrences to Omarchy's notification CLI.
+
+  // Writable because the shell injects its canonical path into services.
+  property string omarchyPath: Quickshell.env("OMARCHY_PATH")
+  readonly property string notificationSender: omarchyPath
+    ? omarchyPath + "/bin/omarchy-notification-send"
+    : "omarchy-notification-send"
+  property double alertCursor: 0
+  property double alertWindowEnd: 0
+
+  function pollAlerts() {
+    if (!settingsLoaded || alertsProc.running) return
+    var now = Date.now()
+    // A short grace catches a shell reload or brief suspend without producing
+    // a backlog of stale notifications after the machine wakes hours later.
+    var from = alertCursor > 0
+      ? Math.max(alertCursor, now - 5 * 60 * 1000)
+      : now - 2 * 60 * 1000
+    alertWindowEnd = now
+    alertsProc.command = [helper, "alerts",
+                          "--from", new Date(from).toISOString(),
+                          "--to", new Date(now).toISOString()]
+    alertsProc.running = true
+  }
+
+  function alertBody(alert) {
+    var day = Logic.longDate(Logic.dateKey(alert.start || ""))
+    var when = alert.allDay ? "All day"
+      : Logic.formatTime(alert.start || "", String(setting("timeFormat", "12h")))
+    var body = day ? day + (when ? " at " + when : "") : when
+    if (alert.calendar) body += (body ? "\n" : "") + String(alert.calendar)
+    var location = String(alert.location || "").replace(/\s+/g, " ").trim()
+    if (location) body += (body ? " — " : "") + location
+    return body
+  }
+
+  function deliverAlerts(alerts) {
+    var stored = setting("notifiedAlerts", [])
+    var prior = Array.isArray(stored) ? stored : []
+    var seen = ({})
+    for (var i = 0; i < prior.length; i++) seen[String(prior[i])] = true
+
+    var fresh = []
+    var next = prior.slice(Math.max(0, prior.length - 511))
+    for (var a = 0; a < (alerts || []).length; a++) {
+      var alert = alerts[a] || ({})
+      var id = String(alert.id || "")
+      if (!id || seen[id]) continue
+      seen[id] = true
+      next.push(id)
+      fresh.push(alert)
+    }
+    if (!fresh.length) return
+
+    // Optimistically update the service copy before starting notifications;
+    // the normal settings queue persists the same IDs in SQLite.
+    setSetting("notifiedAlerts", next.slice(Math.max(0, next.length - 512)))
+    for (var n = 0; n < fresh.length; n++) {
+      var item = fresh[n]
+      Quickshell.execDetached([
+        notificationSender,
+        "--app-name", "lancefaul.omarcal",
+        "-g", "󰃭",
+        "-u", "normal",
+        String(item.title || "Calendar event"),
+        alertBody(item)
+      ])
+    }
+  }
+
+  property Process alertsProc: Process {
+    running: false
+    stdout: StdioCollector { id: alertsOut; waitForEnd: true }
+    onExited: {
+      var payload = root.parse(alertsOut.text, "")
+      if (!payload || !payload.ok) return
+      root.alertCursor = root.alertWindowEnd
+      root.deliverAlerts(payload.alerts || [])
+    }
+  }
+
+  property Timer alertsTimer: Timer {
+    interval: 30 * 1000
+    repeat: true
+    running: true
+    onTriggered: root.pollAlerts()
   }
 
   // -------------------------------------------------------------- writes

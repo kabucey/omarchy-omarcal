@@ -984,13 +984,13 @@ function countLabel(count) {
 var SETTING_DEFAULTS = {
   weekStartDay: 0,
   timeFormat: "12h",
+  defaultView: "month",
   showWeekNumbers: false,
   refreshMinutes: 15,
   format: CLOCK_FORMATS[0],
   formatAlt: "d MMMM 'W'ww yyyy",
   verticalFormat: VERTICAL_CLOCK_FORMATS[0],
   verticalFormatAlt: "dd\nMMM\n'W'ww\n''yy",
-  wrapEvents: false,
   dayStartHour: 0,
   dayEndHour: 24
 }
@@ -1011,17 +1011,6 @@ function dayEndOptions() {
     out.push({ value: String(h), label: hourLabels("12h")[h % 24] })
   return out
 }
-
-// How the day panel treats a title or an address too long for its column.
-// Cutting it off is the default because it keeps every entry the same height
-// and the list scannable; wrapping is for when the whole name matters more
-// than the shape of the list.
-var WRAP_OPTIONS = [
-  { value: "false", label: "One line" },
-  { value: "true", label: "Wrap" }
-]
-
-function wrapOptions() { return WRAP_OPTIONS }
 
 function settingDefaults() { return SETTING_DEFAULTS }
 

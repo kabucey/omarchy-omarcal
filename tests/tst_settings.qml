@@ -130,22 +130,6 @@ TestCase {
     compare(Logic.cacheLabel(18 * 1024 * 1024, 5405), "18.0 MB · 5,405 cached")
   }
 
-  function test_wrap_options() {
-    var options = Logic.wrapOptions()
-    compare(options.length, 2)
-    // The values are what a Dropdown emits, which is always a string, and
-    // the panel turns them back into the boolean the setting stores.
-    compare(options[0].value, "false")
-    compare(options[1].value, "true")
-    compare(options[0].label, "One line")
-  }
-
-  // Cutting off is the default: it keeps every entry the same height and the
-  // list scannable, which is what the column is for.
-  function test_wrapping_is_off_by_default() {
-    compare(Logic.settingDefault("wrapEvents"), false)
-  }
-
   function test_day_window_options() {
     var starts = Logic.dayStartOptions()
     compare(starts.length, 24)
@@ -171,6 +155,7 @@ TestCase {
     var d = Logic.settingDefaults()
     compare(d.weekStartDay, 0)
     compare(d.timeFormat, "12h")
+    compare(d.defaultView, "month")
     compare(d.showWeekNumbers, false)
     compare(d.refreshMinutes, 15)
     compare(d.format, "dddd HH:mm")

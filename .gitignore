@@ -1,2 +1,4 @@
 __pycache__/
 *.pyc
+/helper/omarcal-native
+/helper/native/target/

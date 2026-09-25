@@ -15,6 +15,19 @@ runner=/usr/lib/qt6/bin/qmltestrunner
 [ -x "$runner" ] || { echo "Qt 6 qmltestrunner not found at $runner"; exit 127; }
 
 status=0
+
+# Build the optional Rust alert command when a Rust toolchain is installed.
+# Source installs without Cargo continue through the Python fallback tests.
+if [ -f helper/native/Cargo.toml ] && command -v cargo >/dev/null 2>&1; then
+  printf '\n== helper/native (Cargo)\n'
+  if ! ./helper/build-native; then
+    echo "native helper build failed"
+    status=1
+  fi
+else
+  echo "Skipping native helper build (Cargo or helper/native/Cargo.toml unavailable)"
+fi
+
 for suite in tests/tst_*.qml; do
   printf '\n== %s\n' "$suite"
   output=$("$runner" -input "$suite" 2>&1)

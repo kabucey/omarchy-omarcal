@@ -987,6 +987,64 @@ CREATE TABLE IF NOT EXISTS objects (
 CREATE INDEX IF NOT EXISTS objects_calendar ON objects(calendar);
 CREATE INDEX IF NOT EXISTS objects_span ON objects(open_ended, last_end, first_start);
 CREATE INDEX IF NOT EXISTS objects_uid ON objects(uid);
+-- The alert projection is replaced atomically. A missing, invalidated, or
+-- not-yet-built projection has built_revision != source_revision (or an
+-- unsupported version); a valid projection with no rows is a real empty set.
+CREATE TABLE IF NOT EXISTS alert_cache_meta (
+    id                   INTEGER PRIMARY KEY CHECK(id=1),
+    source_revision      INTEGER NOT NULL DEFAULT 0,
+    built_revision       INTEGER NOT NULL DEFAULT -1,
+    schema_version       INTEGER NOT NULL DEFAULT 1,
+    projection_version   INTEGER NOT NULL DEFAULT 0,
+    timezone_fingerprint TEXT NOT NULL DEFAULT '',
+    coverage_from        INTEGER NOT NULL DEFAULT 0,
+    coverage_to          INTEGER NOT NULL DEFAULT 0,
+    projected_objects    INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO alert_cache_meta(id) VALUES(1);
+CREATE TABLE IF NOT EXISTS alert_occurrences (
+    id                   TEXT PRIMARY KEY,
+    calendar             TEXT NOT NULL,
+    alert_at             INTEGER NOT NULL,
+    href                 TEXT NOT NULL,
+    payload              TEXT NOT NULL,
+    source_first_start   INTEGER NOT NULL,
+    source_last_end      INTEGER NOT NULL,
+    source_open_ended    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS alert_occurrences_due
+    ON alert_occurrences(alert_at, calendar);
+-- Calendar sync updates ctag/token/synced_at/error frequently; those fields
+-- do not change a projected alert. Rendering and visibility fields do.
+CREATE TRIGGER IF NOT EXISTS alert_calendar_insert AFTER INSERT ON calendars BEGIN
+    UPDATE alert_cache_meta SET source_revision=source_revision+1 WHERE id=1;
+END;
+CREATE TRIGGER IF NOT EXISTS alert_calendar_delete AFTER DELETE ON calendars BEGIN
+    UPDATE alert_cache_meta SET source_revision=source_revision+1 WHERE id=1;
+END;
+CREATE TRIGGER IF NOT EXISTS alert_calendar_update
+AFTER UPDATE OF url,name,color,readonly,enabled ON calendars
+WHEN OLD.url IS NOT NEW.url OR OLD.name IS NOT NEW.name
+  OR OLD.color IS NOT NEW.color OR OLD.readonly IS NOT NEW.readonly
+  OR OLD.enabled IS NOT NEW.enabled
+BEGIN
+    UPDATE alert_cache_meta SET source_revision=source_revision+1 WHERE id=1;
+END;
+CREATE TRIGGER IF NOT EXISTS alert_object_insert AFTER INSERT ON objects BEGIN
+    UPDATE alert_cache_meta SET source_revision=source_revision+1 WHERE id=1;
+END;
+CREATE TRIGGER IF NOT EXISTS alert_object_delete AFTER DELETE ON objects BEGIN
+    UPDATE alert_cache_meta SET source_revision=source_revision+1 WHERE id=1;
+END;
+CREATE TRIGGER IF NOT EXISTS alert_object_update
+AFTER UPDATE OF url,calendar,ics,first_start,last_end,open_ended,summary,uid ON objects
+WHEN OLD.url IS NOT NEW.url OR OLD.calendar IS NOT NEW.calendar
+  OR OLD.ics IS NOT NEW.ics OR OLD.first_start IS NOT NEW.first_start
+  OR OLD.last_end IS NOT NEW.last_end OR OLD.open_ended IS NOT NEW.open_ended
+  OR OLD.summary IS NOT NEW.summary OR OLD.uid IS NOT NEW.uid
+BEGIN
+    UPDATE alert_cache_meta SET source_revision=source_revision+1 WHERE id=1;
+END;
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 -- Saves and deletes made while iCloud could not be reached, in the order
 -- they were made. `state` is queued, or conflict once one could not be sent.
@@ -1191,6 +1249,7 @@ def persist_account(conn, account_id: str, user: str, identity: str,
              account_id, int(cal["readonly"])),
         )
     conn.commit()
+    refresh_alert_cache_best_effort(conn)
     return calendar_conflicts
 
 
@@ -1424,6 +1483,7 @@ def sync(conn, only: str = "", force: bool = False) -> dict:
                             "ok": False, "error": str(error)[:200]})
 
     conn.commit()
+    refresh_alert_cache_best_effort(conn)
     return {
         "ok": True,
         "flushed": flushed,
@@ -1880,6 +1940,20 @@ def events(conn, start: datetime, end: datetime, only: list[str]) -> dict:
 # always included, and a month keeps the frequent poll from parsing the whole
 # cache while leaving ample room beyond every alert this UI can create.
 ALERT_EVENT_HORIZON = timedelta(days=32)
+ALERT_PROJECTION_VERSION = 1
+ALERT_CACHE_PAST_SECONDS = 32 * 24 * 60 * 60
+ALERT_CACHE_FUTURE_SECONDS = 32 * 24 * 60 * 60
+ALERT_PROJECTION_SCAN_GUARD = timedelta(days=1)
+# A bad or unusually large calendar set must not turn a cache refresh into an
+# unbounded startup or sync operation. Failure leaves the old projection
+# untouched and callers use the established parser until a later rebuild.
+MAX_ALERT_PROJECTION_OBJECTS = 25000
+MAX_ALERT_PROJECTION_OBJECT_BYTES = 1024 * 1024
+MAX_ALERT_PROJECTION_ROWS = 100000
+MAX_ALERT_PROJECTION_BYTES = 64 * 1024 * 1024
+MAX_ALERT_PROJECTION_STEPS = 250000
+MAX_ALERT_PROJECTION_CHUNK_STEPS = 250
+MAX_ALERT_PROJECTION_SECONDS = 8
 
 
 def alarm_specs(parsed, comp) -> list[dict]:
@@ -1950,19 +2024,199 @@ def component_cancelled(comp) -> bool:
     return property_text(comp, ICal.PropertyKind.STATUS_PROPERTY).upper() == "CANCELLED"
 
 
-def alerts(conn, start: datetime, end: datetime) -> dict:
-    """Calendar alerts due in [start, end), expanded into real occurrences."""
+class AlertProjectionLimit(Exception):
+    """The projection exceeded a deliberate work or storage bound."""
+
+
+def recurrence_expansion_upper_bound(comp, window_seconds: int) -> int:
+    """Conservatively bound callbacks before calling void foreach_recurrence.
+
+    libical's foreach callback has no cancellation result. The projection uses
+    this conservative RRULE/RDATE count before entering libical; unsupported
+    recurrence forms decline the projection and retain the legacy parser path.
+    """
+    if props_of(comp, ICal.PropertyKind.EXRULE_PROPERTY):
+        # EXRULE adds a second expansion stream internally. It is deprecated
+        # and uncommon; do not guess at its work bound.
+        raise AlertProjectionLimit("EXRULE projection is not bounded")
+
+    total = 1  # DTSTART is always visited by foreach_recurrence.
+    for prop in props_of(comp, ICal.PropertyKind.RDATE_PROPERTY):
+        raw = (prop.get_value_as_string() or "").strip()
+        if len(raw) > 65536:
+            raise AlertProjectionLimit("RDATE projection is too large")
+        if raw:
+            total += raw.count(",") + 1
+
+    allowed = {
+        "FREQ", "INTERVAL", "COUNT", "UNTIL", "WKST", "BYSECOND",
+        "BYMINUTE", "BYHOUR", "BYDAY", "BYMONTHDAY", "BYYEARDAY",
+        "BYWEEKNO", "BYMONTH", "BYSETPOS",
+    }
+    seconds_per_period = {
+        "SECONDLY": 1,
+        "MINUTELY": 60,
+        "HOURLY": 60 * 60,
+        "DAILY": 24 * 60 * 60,
+        "WEEKLY": 7 * 24 * 60 * 60,
+        # Month and year period lengths use their shortest legal spans.
+        "MONTHLY": 28 * 24 * 60 * 60,
+        "YEARLY": 365 * 24 * 60 * 60,
+    }
+
+    for prop in props_of(comp, ICal.PropertyKind.RRULE_PROPERTY):
+        raw = (prop.get_value_as_string() or "").strip()
+        if not raw or len(raw) > 65536:
+            raise AlertProjectionLimit("RRULE projection is not bounded")
+        fields = {}
+        for part in raw.split(";"):
+            key, separator, value = part.partition("=")
+            key = key.upper()
+            if not separator or not value or key not in allowed or key in fields:
+                raise AlertProjectionLimit("RRULE projection is not bounded")
+            fields[key] = value
+
+        frequency = fields.get("FREQ", "").upper()
+        if frequency not in seconds_per_period:
+            raise AlertProjectionLimit("RRULE projection is not bounded")
+        try:
+            interval = int(fields.get("INTERVAL", "1"))
+        except ValueError as error:
+            raise AlertProjectionLimit("RRULE interval is invalid") from error
+        if interval < 1:
+            raise AlertProjectionLimit("RRULE interval is invalid")
+
+        period_seconds = seconds_per_period[frequency] * interval
+        periods = max(1, (max(0, window_seconds) + period_seconds - 1) // period_seconds + 2)
+
+        def selector_size(name: str, maximum: int) -> int:
+            values = fields.get(name)
+            if values is None:
+                return 1
+            size = values.count(",") + 1
+            if size > maximum or any(not item for item in values.split(",")):
+                raise AlertProjectionLimit("RRULE selector is not bounded")
+            return size
+
+        if frequency == "SECONDLY":
+            time_expansion = 1
+        elif frequency == "MINUTELY":
+            time_expansion = selector_size("BYSECOND", 61)
+        elif frequency == "HOURLY":
+            time_expansion = (selector_size("BYMINUTE", 60)
+                              * selector_size("BYSECOND", 61))
+        elif frequency == "DAILY":
+            time_expansion = (selector_size("BYHOUR", 24)
+                              * selector_size("BYMINUTE", 60)
+                              * selector_size("BYSECOND", 61))
+        else:
+            time_expansion = (selector_size("BYHOUR", 24)
+                              * selector_size("BYMINUTE", 60)
+                              * selector_size("BYSECOND", 61))
+
+        date_selectors = {"BYDAY", "BYMONTHDAY", "BYYEARDAY", "BYWEEKNO", "BYMONTH"}
+        has_date_selector = any(name in fields for name in date_selectors)
+        if frequency == "WEEKLY":
+            dates_per_period = min(7, selector_size("BYDAY", 7))
+        elif frequency == "MONTHLY":
+            dates_per_period = 31 if has_date_selector else 1
+        elif frequency == "YEARLY":
+            dates_per_period = 366 if has_date_selector else 1
+        else:
+            dates_per_period = 1
+
+        rule_bound = periods * dates_per_period * time_expansion
+        if "COUNT" in fields:
+            try:
+                count = int(fields["COUNT"])
+            except ValueError as error:
+                raise AlertProjectionLimit("RRULE count is invalid") from error
+            if count < 1:
+                raise AlertProjectionLimit("RRULE count is invalid")
+            # DTSTART is counted separately by foreach_recurrence.
+            rule_bound = min(rule_bound, count + 1)
+        total += rule_bound
+        if total > MAX_ALERT_PROJECTION_STEPS:
+            raise AlertProjectionLimit("recurrence projection step limit exceeded")
+
+    if total > MAX_ALERT_PROJECTION_STEPS:
+        raise AlertProjectionLimit("recurrence projection step limit exceeded")
+    return total
+
+
+def bounded_recurrence_chunks(comp, start: int, end: int) -> tuple[list, int]:
+    """Split void-callback expansion into preflighted calls of at most 250 steps."""
+    pending = [(start, end)]
+    chunks = []
+    total = 0
+    while pending:
+        lower, upper = pending.pop()
+        bound = recurrence_expansion_upper_bound(comp, upper - lower)
+        if bound <= MAX_ALERT_PROJECTION_CHUNK_STEPS:
+            total += bound
+            if total > MAX_ALERT_PROJECTION_STEPS:
+                raise AlertProjectionLimit("recurrence projection step limit exceeded")
+            chunks.append((lower, upper, bound))
+            continue
+        if upper - lower <= 1:
+            raise AlertProjectionLimit("one-second recurrence window exceeds its work bound")
+        middle = lower + (upper - lower) // 2
+        pending.append((middle, upper))
+        pending.append((lower, middle))
+    chunks.sort(key=lambda item: item[0])
+    return chunks, total
+
+
+def alert_timezone_fingerprint() -> str:
+    """Hash the local zone identity and rule file in a Rust-friendly format.
+
+    The input is UTF-8 for four NUL-separated fields: a format tag, the zone
+    name, TZ's raw environment value, and the lowercase SHA-256 of
+    /etc/localtime (empty if it cannot be read). The outer SHA-256 is lowercase
+    hex. Including the TZif bytes notices rule updates that keep the same name.
+    """
+    try:
+        with open("/etc/localtime", "rb") as zone_file:
+            zone_rules = hashlib.sha256(zone_file.read()).hexdigest()
+    except OSError:
+        zone_rules = ""
+    material = "\0".join((
+        "omarcal-alert-tz-v1", local_zone_name(), os.environ.get("TZ", ""), zone_rules,
+    ))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def alert_cache_meta(conn):
+    return conn.execute(
+        "SELECT source_revision,built_revision,schema_version,projection_version,"
+        "timezone_fingerprint,coverage_from,coverage_to,projected_objects "
+        "FROM alert_cache_meta WHERE id=1"
+    ).fetchone()
+
+
+def alert_cache_matches(meta, fingerprint: str, window_start: int,
+                        window_end: int) -> bool:
+    return bool(meta and meta[0] == meta[1] and meta[2] == 1
+                and meta[3] == ALERT_PROJECTION_VERSION
+                and meta[4] == fingerprint
+                and meta[5] <= window_start and window_end <= meta[6])
+
+
+def project_alert_occurrences(conn, start: datetime, end: datetime,
+                              bounded: bool = False,
+                              source_spans: dict | None = None) -> tuple[list, int]:
+    """Expand alerts due in [start, end); optionally enforce cache bounds."""
     started = time.monotonic()
     cals = visible_calendars(conn)
     if not cals:
-        return {"ok": True, "alerts": [], "parsed": 0,
-                "range": {"start": start.isoformat(), "end": end.isoformat()}}
+        return [], 0
 
     lower, upper = int(start.timestamp()), int(end.timestamp())
-    scan_lower = int((start - ALERT_EVENT_HORIZON).timestamp())
-    scan_upper = int((end + ALERT_EVENT_HORIZON).timestamp())
+    guard = ALERT_PROJECTION_SCAN_GUARD if bounded else timedelta(0)
+    scan_lower = int((start - ALERT_EVENT_HORIZON - guard).timestamp())
+    scan_upper = int((end + ALERT_EVENT_HORIZON + guard).timestamp())
     rows = conn.execute(
-        "SELECT url,calendar,ics FROM objects WHERE "
+        "SELECT url,calendar,ics,first_start,last_end,open_ended FROM objects WHERE "
         "instr(upper(ics),'BEGIN:VALARM')>0 "
         "AND (open_ended=1 OR (last_end>=? AND first_start<?)) "
         f"AND calendar IN ({','.join('?' * len(cals))})",
@@ -1970,11 +2224,50 @@ def alerts(conn, start: datetime, end: datetime) -> dict:
     )
     out = []
     parsed_count = 0
-    for href, calendar, ics in rows:
+    encoded_bytes = 0
+    projected_recurrence_steps = 0
+    projection_limit = False
+    current_span = (0, 0, 1)
+
+    def check_budget():
+        if bounded and time.monotonic() - started > MAX_ALERT_PROJECTION_SECONDS:
+            raise AlertProjectionLimit("alert projection time limit exceeded")
+        if bounded and (parsed_count > MAX_ALERT_PROJECTION_OBJECTS
+                        or len(out) > MAX_ALERT_PROJECTION_ROWS
+                        or encoded_bytes > MAX_ALERT_PROJECTION_BYTES):
+            raise AlertProjectionLimit("alert projection size limit exceeded")
+
+    def append(comp, cal, href, begin, finish, spec, rid=""):
+        nonlocal encoded_bytes, projection_limit
+        if projection_limit:
+            return
+        before = len(out)
+        append_due_alert(out, comp, cal, href, begin, finish, spec,
+                         lower, upper, rid)
+        if bounded and len(out) > before:
+            # Count the encoded JSON bytes before SQLite writes anything. This
+            # also bounds unusually large summaries, descriptions, or URLs.
+            item = out[-1]
+            size = len(json.dumps(item, ensure_ascii=False).encode("utf-8"))
+            if (len(out) > MAX_ALERT_PROJECTION_ROWS
+                    or encoded_bytes + size > MAX_ALERT_PROJECTION_BYTES):
+                out.pop()
+                projection_limit = True
+                return
+            encoded_bytes += size
+            if source_spans is not None:
+                source_spans[item["id"]] = current_span
+
+    for href, calendar, ics, first_start, last_end, open_ended in rows:
+        check_budget()
+        if bounded and len(ics.encode("utf-8")) > MAX_ALERT_PROJECTION_OBJECT_BYTES:
+            raise AlertProjectionLimit("calendar object exceeds alert projection byte limit")
+        current_span = (first_start, last_end, open_ended)
         parsed = parse_ics(ics)
         if parsed is None:
             continue
         parsed_count += 1
+        check_budget()
         master, overrides = split_master_overrides(parsed, vevents(parsed))
         cal = cals.get(calendar, {})
 
@@ -1985,8 +2278,9 @@ def alerts(conn, start: datetime, end: datetime) -> dict:
             # Absolute alarms name one instant, not one instant per recurrence.
             for spec in specs:
                 if "absolute" in spec:
-                    append_due_alert(out, master, cal, href, original_begin,
-                                     original_finish, spec, lower, upper)
+                    append(master, cal, href, original_begin, original_finish, spec)
+                    if projection_limit:
+                        raise AlertProjectionLimit("alert projection row/byte limit exceeded")
 
             relative = [spec for spec in specs if "offset" in spec]
             if relative:
@@ -1999,35 +2293,234 @@ def alerts(conn, start: datetime, end: datetime) -> dict:
                     datetime.fromtimestamp(occurrence_from, timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
                 win_end = ICal.Time.new_from_string(
                     datetime.fromtimestamp(occurrence_to, timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+                step_bound = None
+                chunks = None
+                if bounded:
+                    chunks, step_bound = bounded_recurrence_chunks(
+                        master, occurrence_from, occurrence_to)
+                    projected_recurrence_steps += step_bound
+                    if projected_recurrence_steps > MAX_ALERT_PROJECTION_STEPS:
+                        raise AlertProjectionLimit("recurrence projection step limit exceeded")
+                recurrence_steps = 0
+                seen_recurrence_starts = set()
+                chunk_step_count = 0
+                callback_error = None
 
                 def collect(_comp, span, _data):
-                    begin, finish = span.get_start(), span.get_end()
-                    if begin in overrides:
-                        return True
-                    for spec in relative:
-                        append_due_alert(out, master, cal, href, begin, finish,
-                                         spec, lower, upper)
+                    nonlocal recurrence_steps, chunk_step_count, callback_error
+                    try:
+                        recurrence_steps += 1
+                        chunk_step_count += 1
+                        begin, finish = span.get_start(), span.get_end()
+                        if bounded and begin in seen_recurrence_starts:
+                            return True
+                        if bounded:
+                            seen_recurrence_starts.add(begin)
+                        if begin in overrides:
+                            return True
+                        for spec in relative:
+                            append(master, cal, href, begin, finish, spec)
+                            if projection_limit:
+                                break
+                    except Exception as error:
+                        callback_error = error
                     return True
 
-                try:
-                    master.foreach_recurrence(win_start, win_end, collect, None)
-                except Exception:
-                    pass
+                if bounded:
+                    for chunk_from, chunk_to, chunk_bound in chunks:
+                        if time.monotonic() - started > MAX_ALERT_PROJECTION_SECONDS:
+                            raise AlertProjectionLimit("alert projection time limit exceeded")
+                        chunk_start = ICal.Time.new_from_string(
+                            datetime.fromtimestamp(chunk_from, timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+                        chunk_end = ICal.Time.new_from_string(
+                            datetime.fromtimestamp(chunk_to, timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+                        chunk_step_count = 0
+                        try:
+                            master.foreach_recurrence(chunk_start, chunk_end, collect, None)
+                        except Exception as error:
+                            raise AlertProjectionLimit("libical recurrence expansion failed") from error
+                        if callback_error is not None:
+                            raise AlertProjectionLimit("libical recurrence callback failed") from callback_error
+                        if chunk_step_count > chunk_bound:
+                            raise AlertProjectionLimit("recurrence preflight was exceeded")
+                        if time.monotonic() - started > MAX_ALERT_PROJECTION_SECONDS:
+                            raise AlertProjectionLimit("alert projection time limit exceeded")
+                        if projection_limit:
+                            raise AlertProjectionLimit("alert projection row/byte limit exceeded")
+                else:
+                    try:
+                        master.foreach_recurrence(win_start, win_end, collect, None)
+                    except Exception:
+                        pass
+                if bounded and recurrence_steps > step_bound:
+                    raise AlertProjectionLimit("recurrence preflight was exceeded")
+                if bounded and time.monotonic() - started > MAX_ALERT_PROJECTION_SECONDS:
+                    raise AlertProjectionLimit("alert projection time limit exceeded")
+                if bounded and projection_limit:
+                    raise AlertProjectionLimit("alert projection row/byte limit exceeded")
 
         # An override replaces its master slot and carries its own alarms. Do
         # not invent inheritance here: a provider can intentionally remove an
         # alert from one occurrence by omitting its VALARMs.
         for rid_at, comp in overrides.items():
+            check_budget()
             if component_cancelled(comp):
                 continue
             begin, finish = span_of(parsed, comp)
             rid = comp.get_recurrenceid()
             rid_text = rid.as_ical_string() if rid is not None else str(rid_at)
             for spec in alarm_specs(parsed, comp):
-                append_due_alert(out, comp, cal, href, begin, finish, spec,
-                                 lower, upper, rid_text)
+                append(comp, cal, href, begin, finish, spec, rid_text)
+                if projection_limit:
+                    raise AlertProjectionLimit("alert projection row/byte limit exceeded")
 
     out.sort(key=lambda item: (item["at"], item["title"], item["id"]))
+    return out, parsed_count
+
+
+def _build_alert_cache(conn, fingerprint: str, coverage_from: int,
+                       coverage_to: int, required_from: int,
+                       required_to: int) -> bool:
+    """Replace the complete bounded projection in one SQLite transaction."""
+    if conn.in_transaction:
+        return False
+    try:
+        meta = alert_cache_meta(conn)
+        if alert_cache_matches(meta, fingerprint, required_from, required_to):
+            return True
+
+        conn.execute("BEGIN IMMEDIATE")
+        meta = alert_cache_meta(conn)
+        fingerprint = alert_timezone_fingerprint()
+        if alert_cache_matches(meta, fingerprint, required_from, required_to):
+            conn.rollback()
+            return True
+
+        source_revision = meta[0] if meta else 0
+        build_started = time.monotonic()
+        payload_rows = []
+        payload_bytes = 0
+        source_spans = {}
+        rows, projected_objects = project_alert_occurrences(
+            conn,
+            datetime.fromtimestamp(coverage_from, timezone.utc),
+            datetime.fromtimestamp(coverage_to, timezone.utc),
+            bounded=True,
+            source_spans=source_spans,
+        )
+        if time.monotonic() - build_started > MAX_ALERT_PROJECTION_SECONDS:
+            raise AlertProjectionLimit("alert projection time limit exceeded")
+        for item in rows:
+            payload = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+            payload_bytes += len(payload.encode("utf-8"))
+            if payload_bytes > MAX_ALERT_PROJECTION_BYTES:
+                raise AlertProjectionLimit("alert projection byte limit exceeded")
+            first_start, last_end, open_ended = source_spans[item["id"]]
+            payload_rows.append((item["id"], item["calendarUrl"],
+                                 int(datetime.fromisoformat(item["at"].replace("Z", "+00:00")).timestamp()),
+                                 item["href"], payload, first_start, last_end,
+                                 open_ended))
+        conn.execute("DELETE FROM alert_occurrences")
+        conn.executemany(
+            "INSERT INTO alert_occurrences(id,calendar,alert_at,href,payload,"
+            "source_first_start,source_last_end,source_open_ended) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            payload_rows,
+        )
+        if alert_timezone_fingerprint() != fingerprint:
+            raise AlertProjectionLimit("local timezone changed during alert projection")
+        conn.execute(
+            "UPDATE alert_cache_meta SET built_revision=?,schema_version=1,"
+            "projection_version=?,timezone_fingerprint=?,coverage_from=?,coverage_to=?,"
+            "projected_objects=? WHERE id=1",
+            (source_revision, ALERT_PROJECTION_VERSION, fingerprint,
+             coverage_from, coverage_to, projected_objects),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        return False
+
+
+def refresh_alert_cache_best_effort(conn, required_from: int | None = None,
+                                    required_to: int | None = None) -> bool:
+    """Refresh only when needed for the requested window (or live alert poll)."""
+    if conn.in_transaction:
+        return False
+    now = int(time.time())
+    coverage_from = now - ALERT_CACHE_PAST_SECONDS
+    coverage_to = now + ALERT_CACHE_FUTURE_SECONDS
+    if required_from is None:
+        required_from = now - 5 * 60
+    if required_to is None:
+        required_to = now + 1
+    if required_from < coverage_from or required_to > coverage_to:
+        return False
+    fingerprint = alert_timezone_fingerprint()
+    try:
+        meta = alert_cache_meta(conn)
+    except sqlite3.DatabaseError:
+        return False
+    if alert_cache_matches(meta, fingerprint, required_from, required_to):
+        return True
+    return _build_alert_cache(conn, fingerprint, coverage_from, coverage_to,
+                              required_from, required_to)
+
+
+def cached_alerts(conn, start: datetime, end: datetime) -> tuple[bool, list]:
+    lower, upper = int(start.timestamp()), int(end.timestamp())
+    owns_snapshot = not conn.in_transaction
+    snapshot_valid = False
+    try:
+        if owns_snapshot:
+            conn.execute("BEGIN")
+        meta = alert_cache_meta(conn)
+        if not alert_cache_matches(meta, alert_timezone_fingerprint(), lower, upper):
+            return False, []
+        rows = conn.execute(
+        "SELECT ao.payload FROM alert_occurrences ao "
+        "JOIN calendars c ON c.url=ao.calendar AND c.enabled=1 "
+        "WHERE ao.alert_at>=? AND ao.alert_at<? "
+        "AND (source_open_ended=1 OR (source_last_end>=? AND source_first_start<?)) "
+        "ORDER BY ao.alert_at, ao.href, ao.id",
+        [lower, upper,
+         int((start - ALERT_EVENT_HORIZON).timestamp()),
+         int((end + ALERT_EVENT_HORIZON).timestamp())],
+        ).fetchall()
+        alerts = []
+        for row in rows:
+            item = json.loads(row[0])
+            if not isinstance(item, dict) or any(
+                    key not in item for key in ("id", "at", "title", "href")):
+                return False, []
+            alerts.append(item)
+        alerts.sort(key=lambda item: (item["at"], item["title"], item["id"]))
+        snapshot_valid = True
+        return True, alerts
+    except (sqlite3.DatabaseError, TypeError, ValueError, KeyError):
+        return False, []
+    finally:
+        if owns_snapshot and conn.in_transaction:
+            if snapshot_valid:
+                conn.commit()
+            else:
+                conn.rollback()
+
+
+def alerts(conn, start: datetime, end: datetime) -> dict:
+    """Calendar alerts due in [start, end), using a valid projection when covered."""
+    started = time.monotonic()
+    lower, upper = int(start.timestamp()), int(end.timestamp())
+    valid, out = cached_alerts(conn, start, end)
+    if not valid:
+        refresh_alert_cache_best_effort(conn, lower, upper)
+        valid, out = cached_alerts(conn, start, end)
+    if valid:
+        parsed_count = len({item.get("href", "") for item in out})
+    else:
+        out, parsed_count = project_alert_occurrences(conn, start, end)
     return {
         "ok": True,
         "alerts": out,
@@ -3457,6 +3950,7 @@ def refresh_objects(conn, session: DavSession, urls: list[str], gone: list[str])
             "pending=0",
             (url, calendar, got.get("etag", ""), text, first, last, open_ended, summary, uid))
     conn.commit()
+    refresh_alert_cache_best_effort(conn)
 
 
 def account_of_url(conn, url: str) -> str:
@@ -3546,6 +4040,7 @@ def enqueue(conn, request: dict, deleting: bool) -> dict:
         else:
             conn.execute("DELETE FROM objects WHERE url=?", (op["url"],))
     conn.commit()
+    refresh_alert_cache_best_effort(conn)
     return {"ok": True, "queued": True, "pending": queued_count(conn)}
 
 
@@ -3583,11 +4078,13 @@ def flush_pending(conn) -> dict:
                 conn.execute("UPDATE pending SET state='conflict', error=? WHERE id=?",
                              ("not sent: an earlier change could not be", held))
             conn.commit()
+            refresh_alert_cache_best_effort(conn)
             return {"sent": sent, "conflict": True}
         conn.execute("DELETE FROM pending_backup WHERE pending_id=?", (pending_id,))
         conn.execute("DELETE FROM pending WHERE id=?", (pending_id,))
         conn.commit()
         sent += 1
+    refresh_alert_cache_best_effort(conn)
     return {"sent": sent}
 
 
@@ -4265,6 +4762,7 @@ def _dispatch_unlocked(conn, args) -> dict:
         conn.execute("DELETE FROM contact_state WHERE account=?", (account_id,))
         removed = conn.execute("DELETE FROM accounts WHERE id=?", (account_id,)).rowcount
         conn.commit()
+        refresh_alert_cache_best_effort(conn)
         reclaim(conn)
         return {"ok": True, "removed": bool(removed), "accountId": account_id,
                 "calendars": len(urls), "warning": warning}
@@ -4284,6 +4782,7 @@ def _dispatch_unlocked(conn, args) -> dict:
         conn.execute(
             "UPDATE calendars SET enabled=0, ctag='', token='' WHERE url=?", (row[0],))
         conn.commit()
+        refresh_alert_cache_best_effort(conn)
         reclaim(conn)
         return {"ok": True, "forgotten": row[0], "objects": dropped}
 
@@ -4308,6 +4807,7 @@ def _dispatch_unlocked(conn, args) -> dict:
             (*values, args.calendar),
         ).rowcount
         conn.commit()
+        refresh_alert_cache_best_effort(conn)
         return {"ok": True, "changed": changed}
 
     if args.command == "sync":

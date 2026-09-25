@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+helper_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+native="$helper_dir/omarcal-native"
+python_helper="$helper_dir/omarcal-helper"
+
+if [ -x "$native" ]; then
+  exec "$native" "$@"
+fi
+
+exec python3 "$python_helper" "$@"

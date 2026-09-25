@@ -3,7 +3,7 @@ import Quickshell
 import Quickshell.Io
 import "Logic.js" as Logic
 
-// Everything that talks to helper/omarcal-helper.
+// Everything that talks to the omarcal helper launcher.
 //
 // The helper always prints one JSON object and exits 0, so a failure arrives
 // as `ok: false` with a code rather than as a crash or empty output. Nothing
@@ -78,7 +78,7 @@ QtObject {
   property string rangeEnd: ""
 
   readonly property string helper: decodeURIComponent(
-    Qt.resolvedUrl("helper/omarcal-helper").toString().replace(/^file:\/\//, ""))
+    Qt.resolvedUrl("helper/omarcal").toString().replace(/^file:\/\//, ""))
 
   signal eventsLoaded()
   signal accountAdded(int requestId)

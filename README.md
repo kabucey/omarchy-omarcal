@@ -9,6 +9,12 @@ degrades to an error on that calendar alone instead of hanging the widget.
 Parsing, recurrence expansion and VTIMEZONE handling come from `libical`,
 which is already on the system.
 
+The helper remains Python for CalDAV, writes and calendar parsing. The
+notification poll can use an optional Rust executable to read a SQLite
+projection of upcoming alerts; the launcher falls back to Python when that
+executable is not installed. The projection is refreshed when cached calendar
+data changes and covers a rolling 32 days before and after the current time.
+
 It supports iCloud with an app-specific password and Google Calendar through
 OAuth in the system browser. Provider credentials stay in the desktop keyring.
 
@@ -147,6 +153,7 @@ Everything here ships with Omarchy; none of it comes from pip.
 | `libsecret` | `secret-tool`, for the keyring |
 | `wl-clipboard` | `wl-copy`, for the copy buttons |
 | `xdg-desktop-portal-gtk` | the file dialog for attachments |
+| `cargo` (optional) | build the Rust alert-poll executable |
 
 ## Where things are kept
 
@@ -171,11 +178,24 @@ omarchy plugin remove lancefaul.omarcal
 
 ```bash
 ./test/all          # every suite, headless, no display needed
+./helper/build-native # optional: build the faster alert-poll executable
 ```
 
 `Logic.js` holds every layout and formatting decision the views make and is
 covered by the suite; the QML only draws. The test fixture is a real month's
 worth of shapes with the names, addresses and identifiers replaced.
+
+The full test runner builds the native helper when Cargo is available. Without
+Cargo or a built helper, it exercises the Python fallback. To compare repeated
+poll latency on a private synthetic cache (no account data or network access),
+build the native helper and run:
+
+```bash
+python3 bench/alerts.py --objects 500 --iterations 12
+```
+
+The benchmark checks that both backends return the same alerts and reports
+their median poll time. Its temporary cache is removed when it exits.
 
 ## Licence
 

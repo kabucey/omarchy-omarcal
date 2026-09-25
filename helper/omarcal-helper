@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import http.client
 import json
 import os
@@ -40,8 +41,9 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
-from urllib.parse import quote
+from urllib.parse import quote, urljoin, urlsplit
 from zoneinfo import ZoneInfo
 from xml.etree import ElementTree as ET
 
@@ -75,6 +77,7 @@ MULTIGET_BATCH = 64
 # Higher than this buys nothing and risks throttling.
 SYNC_WORKERS = 4
 MAX_EXPAND = 20000
+MAX_DAV_REDIRECTS = 5
 
 KEYRING_SCHEMA = "org.omarchy.omarcal"
 
@@ -124,9 +127,11 @@ DEFAULT_SETTINGS = {
     "defaultView": "month",
     "showWeekNumbers": False,
     "refreshMinutes": 15,
-    # The bar clock's face. Qt format strings, read by BarWidget.qml.
-    "format": "dddd, MMMM d, yyyy '\u2022' hh:mm:ss AP",
-    "verticalFormat": "HH\nmm\nss",
+    # The bar clock's face. These defaults and rings match Omarchy's clock.
+    "format": "dddd HH:mm",
+    "formatAlt": "d MMMM 'W'ww yyyy",
+    "verticalFormat": "HH\n—\nmm",
+    "verticalFormatAlt": "dd\nMMM\n'W'ww\n''yy",
     # Whether a long title or address in the day panel wraps or is cut off.
     "wrapEvents": False,
     # The slice of a day the day and week rails show. The end runs to 24,
@@ -167,12 +172,14 @@ def load_password(account: str) -> str:
 
 def forget_password(account: str) -> None:
     try:
-        subprocess.run(
+        done = subprocess.run(
             ["secret-tool", "clear", "schema", KEYRING_SCHEMA, "account", account],
             capture_output=True, timeout=10,
         )
-    except (OSError, subprocess.SubprocessError):
-        pass
+    except (OSError, subprocess.SubprocessError) as error:
+        raise Failure("keyring", f"could not remove the stored password for {account}") from error
+    if done.returncode != 0:
+        raise Failure("keyring", f"could not remove the stored password for {account}")
 
 
 def stored_password(account: str) -> str:
@@ -217,7 +224,7 @@ class DavSession:
     one dominated the time before this.
     """
 
-    def __init__(self, user: str, password: str):
+    def __init__(self, user: str, password: str, server: str = ICLOUD):
         token = base64.b64encode(f"{user}:{password}".encode()).decode("ascii")
         self.headers = {
             "Authorization": f"Basic {token}",
@@ -226,8 +233,27 @@ class DavSession:
         }
         self._local = threading.local()
         self._context = ssl.create_default_context()
+        self._trusted_origin = url_origin(server)
+        self._trusted_icloud_service = icloud_dav_service(self._trusted_origin[0])
+
+    def _validate_url(self, url: str) -> tuple[str, str]:
+        host, path = split_url(url)
+        origin = url_origin(url)
+        if origin != self._trusted_origin:
+            # iCloud moves calendar collections from the public endpoint to
+            # a per-account DAV shard. Only that documented service family
+            # may cross origins, and only on the standard TLS port.
+            same_icloud_service = (
+                self._trusted_icloud_service is not None
+                and self._trusted_icloud_service == icloud_dav_service(origin[0])
+                and self._trusted_origin[1] == origin[1] == 443
+            )
+            if not same_icloud_service:
+                raise Failure("dav-origin", "DAV URL is outside the trusted server origin")
+        return host, path
 
     def _connection(self, host: str) -> http.client.HTTPSConnection:
+        self._validate_url(f"https://{host}/")
         pool = getattr(self._local, "pool", None)
         if pool is None:
             pool = self._local.pool = {}
@@ -238,27 +264,45 @@ class DavSession:
             )
         return conn
 
+    def _discard_connection(self, host: str, conn: http.client.HTTPSConnection) -> None:
+        try:
+            conn.close()
+        except OSError:
+            pass
+        pool = getattr(self._local, "pool", {})
+        if pool.get(host) is conn:
+            pool.pop(host, None)
+
     def request(self, method: str, url: str, body: str = "", depth: str = "0") -> tuple[int, bytes]:
-        host, path = split_url(url)
+        current_url = url
         headers = dict(self.headers, Depth=depth)
         payload = body.encode("utf-8") if body else None
-        for attempt in (1, 2):
-            conn = self._connection(host)
-            try:
-                conn.request(method, path, body=payload, headers=headers)
-                resp = conn.getresponse()
-                data = resp.read(MAX_RESPONSE_BYTES)
-                return resp.status, data
-            except (http.client.HTTPException, OSError):
-                # A pooled connection the server already closed fails on first
-                # use; drop it and retry once on a fresh one.
+        for redirect in range(MAX_DAV_REDIRECTS + 1):
+            host, path = self._validate_url(current_url)
+            for attempt in (1, 2):
+                conn = self._connection(host)
                 try:
-                    conn.close()
-                except OSError:
-                    pass
-                self._local.pool.pop(host, None)
-                if attempt == 2:
-                    raise
+                    conn.request(method, path, body=payload, headers=headers)
+                    resp = conn.getresponse()
+                    data = resp.read(MAX_RESPONSE_BYTES + 1)
+                    if len(data) > MAX_RESPONSE_BYTES:
+                        self._discard_connection(host, conn)
+                        raise Failure("response-too-large", "DAV response exceeded the size limit")
+                    location = resp.getheader("Location") if 300 <= resp.status < 400 else None
+                    break
+                except (http.client.HTTPException, OSError):
+                    # A pooled connection the server already closed fails on
+                    # first use; drop it and retry once on a fresh one.
+                    self._discard_connection(host, conn)
+                    if attempt == 2:
+                        raise
+            if not (300 <= resp.status < 400) or not location:
+                return resp.status, data
+            if redirect == MAX_DAV_REDIRECTS:
+                raise Failure("dav-redirect", "DAV server redirected too many times")
+            # absolute() validates Location before another request can carry
+            # credentials to it. A cross-origin untrusted redirect is refused.
+            current_url = absolute(current_url, location)
         raise Failure("transport", "unreachable")
 
     def close(self) -> None:
@@ -269,17 +313,54 @@ class DavSession:
                 pass
 
 
+def validate_url_text(url: str) -> None:
+    if "\\" in url or any(ord(char) < 0x20 or ord(char) == 0x7F for char in url):
+        raise Failure("dav-url", "DAV URLs cannot contain control characters or backslashes")
+
+
+def url_origin(url: str) -> tuple[str, int]:
+    validate_url_text(url)
+    parsed = urlsplit(url)
+    if (parsed.scheme.lower() != "https" or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None
+            or parsed.fragment):
+        raise Failure("dav-url", "DAV URLs must be credential-free HTTPS URLs")
+    try:
+        port = parsed.port or 443
+    except ValueError as error:
+        raise Failure("dav-url", "DAV URL has an invalid port") from error
+    return parsed.hostname.rstrip(".").lower(), port
+
+
 def split_url(url: str) -> tuple[str, str]:
-    rest = url.split("://", 1)[1]
-    host, _, path = rest.partition("/")
-    return host, "/" + path
+    """Return the HTTPS authority and request target for an absolute URL."""
+    url_origin(url)  # Reject plaintext, credentials, fragments, and malformed ports.
+    parsed = urlsplit(url)
+    authority = parsed.netloc
+    return authority, (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
+
+
+def icloud_dav_service(host: str) -> str | None:
+    if host == "caldav.icloud.com" or re.fullmatch(r"p[0-9]+-caldav\.icloud\.com", host):
+        return "calendar"
+    if host == "contacts.icloud.com" or re.fullmatch(r"p[0-9]+-contacts\.icloud\.com", host):
+        return "contacts"
+    return None
 
 
 def absolute(base: str, href: str) -> str:
-    if href.startswith("http"):
-        return href
-    host, _ = split_url(base)
-    return f"https://{host}{href}"
+    """Resolve a DAV href without allowing an untrusted origin or downgrade."""
+    validate_url_text(href)
+    base_origin = url_origin(base)
+    resolved = urljoin(base, href)
+    target_origin = url_origin(resolved)
+    if target_origin == base_origin:
+        return resolved
+    base_service = icloud_dav_service(base_origin[0])
+    if (base_service and base_service == icloud_dav_service(target_origin[0])
+            and base_origin[1] == target_origin[1] == 443):
+        return resolved
+    raise Failure("dav-origin", "DAV href is outside the trusted server origin")
 
 
 def text_of(node, path: str) -> str:
@@ -489,6 +570,30 @@ def db() -> sqlite3.Connection:
     return conn
 
 
+@contextmanager
+def state_mutation_lock(conn):
+    """Serialize helper writes across its short-lived processes.
+
+    Sync, writes and account removal all touch the same SQLite cache but are
+    usually separate processes. SQLite protects individual statements; it
+    cannot stop a sync that started before a disconnect from repopulating
+    rows after that disconnect. The advisory lock spans each complete
+    mutating command, while watch takes it once per sync iteration.
+    """
+    row = conn.execute("PRAGMA database_list").fetchone()
+    database = row[2] if row else ""
+    if not database:
+        yield
+        return
+    lock_fd = os.open(database + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
 def accounts_of(conn) -> list[tuple[str, str]]:
     rows = list(conn.execute("SELECT user, server FROM accounts ORDER BY added, user"))
     if not rows:
@@ -521,7 +626,7 @@ def read_settings(conn) -> dict:
 def sync_report(token: str) -> str:
     # No <d:limit> and no <c:calendar-data>: iCloud ignores both here and
     # answers with etags only, so bodies come from calendar-multiget.
-    since = f"<d:sync-token>{token}</d:sync-token>" if token else "<d:sync-token/>"
+    since = f"<d:sync-token>{xml_escape(token)}</d:sync-token>" if token else "<d:sync-token/>"
     return (
         '<?xml version="1.0"?><d:sync-collection xmlns:d="DAV:">'
         f"{since}<d:sync-level>1</d:sync-level>"
@@ -534,13 +639,33 @@ def multiget_body(hrefs: list[str]) -> str:
         '<?xml version="1.0"?><c:calendar-multiget xmlns:d="DAV:" '
         'xmlns:c="urn:ietf:params:xml:ns:caldav">'
         "<d:prop><d:getetag/><c:calendar-data/></d:prop>"
-        + "".join(f"<d:href>{h}</d:href>" for h in hrefs)
+        + "".join(f"<d:href>{xml_escape(h)}</d:href>" for h in hrefs)
         + "</c:calendar-multiget>"
     )
 
 
-def fetch_calendar(session: DavSession, cal: dict, known: dict[str, str],
-                   pool: ThreadPoolExecutor, force: bool) -> dict:
+def dav_status_code(value: str) -> int | None:
+    match = re.search(r"\b(\d{3})\b", value)
+    return int(match.group(1)) if match else None
+
+
+def validate_dav_response(response, operation: str) -> None:
+    direct_status = text_of(response, "d:status")
+    if direct_status:
+        code = dav_status_code(direct_status)
+        if code is None or not 200 <= code < 300:
+            raise Failure("sync-response", f"{operation} returned {direct_status[:80]}")
+        return
+
+    propstats = response.findall("d:propstat", NS)
+    codes = [dav_status_code(text_of(propstat, "d:status")) for propstat in propstats]
+    if not codes or any(code is None or not 200 <= code < 300 for code in codes):
+        detail = next((text_of(propstat, "d:status") for propstat in propstats
+                       if not 200 <= (dav_status_code(text_of(propstat, "d:status")) or 0) < 300), "")
+        raise Failure("sync-response", f"{operation} returned {detail[:80] or 'an incomplete DAV response'}")
+
+
+def fetch_calendar(session: DavSession, cal: dict, known: dict[str, str], force: bool) -> dict:
     """Network half of a sync. Returns rows to write; touches no database."""
     started = time.monotonic()
 
@@ -552,10 +677,12 @@ def fetch_calendar(session: DavSession, cal: dict, known: dict[str, str],
                 "elapsed": round(time.monotonic() - started, 2)}
 
     token = "" if force else cal.get("cached_token", "")
+    full_sync = not token
     status, body = session.request("REPORT", cal["url"], sync_report(token), depth="1")
     if status in (403, 409) and token:
         # Stale or unsupported sync-token: start over.
         token = ""
+        full_sync = True
         status, body = session.request("REPORT", cal["url"], sync_report(""), depth="1")
     if status not in (200, 207):
         return {"url": cal["url"], "ok": False, "error": f"HTTP {status}",
@@ -564,42 +691,64 @@ def fetch_calendar(session: DavSession, cal: dict, known: dict[str, str],
     root = ET.fromstring(body)
     stale: list[str] = []
     removed: list[str] = []
+    listed: set[str] = set()
     for resp in root.findall("d:response", NS):
         href = text_of(resp, "d:href")
-        if not href or href.rstrip("/") == cal["href"].rstrip("/"):
-            continue
+        if not href:
+            raise Failure("sync-response", "sync report returned a resource without an href")
         url = absolute(cal["url"], href)
-        if "404" in text_of(resp, "d:status"):
+        direct_status = dav_status_code(text_of(resp, "d:status"))
+        collection_root = (url.rstrip("/") == cal["url"].rstrip("/")
+                           or href.rstrip("/") == cal["href"].rstrip("/"))
+        if direct_status == 404 and not collection_root:
             removed.append(url)
             continue
+        if collection_root:
+            if direct_status is not None and not 200 <= direct_status < 300:
+                raise Failure("sync-response", "sync report could not read the calendar collection")
+            continue
+        validate_dav_response(resp, "sync report")
+        listed.add(url)
         # Only pull bodies whose etag moved: what makes a warm sync cheap.
         # --force ignores the etags so a changed parser can rebuild the index.
         if force or known.get(url) != text_of(resp, ".//d:getetag"):
             stale.append(href)
 
     batches = [stale[i:i + MULTIGET_BATCH] for i in range(0, len(stale), MULTIGET_BATCH)]
-
-    def fetch(batch: list[str]) -> list[tuple]:
+    rows: list[tuple] = []
+    for batch in batches:
         status, payload = session.request(
             "REPORT", cal["url"], multiget_body(batch), depth="1"
         )
         if status not in (200, 207):
-            return []
-        rows = []
+            raise Failure("multiget", f"calendar-multiget returned HTTP {status}")
+        requested = {absolute(cal["url"], href) for href in batch}
+        received: set[str] = set()
         for resp in ET.fromstring(payload).findall("d:response", NS):
             href = text_of(resp, "d:href")
-            data = text_of(resp, ".//c:calendar-data")
-            if not href or not data:
-                continue
+            if not href:
+                raise Failure("multiget", "calendar-multiget returned a resource without an href")
             url = absolute(cal["url"], href)
+            if url not in requested or url in received:
+                raise Failure("multiget", "calendar-multiget returned an unexpected resource")
+            validate_dav_response(resp, "calendar-multiget")
+            data = text_of(resp, ".//c:calendar-data")
+            etag = text_of(resp, ".//d:getetag")
+            if not data or not etag:
+                raise Failure("multiget", "calendar-multiget omitted event data or etag")
             first, last, open_ended, summary, uid = index_of(data)
-            rows.append((url, cal["url"], text_of(resp, ".//d:getetag"), data,
+            if not uid:
+                raise Failure("calendar-data", "calendar object was malformed or contained no VEVENT")
+            rows.append((url, cal["url"], etag, data,
                          first, last, open_ended, summary, uid))
-        return rows
+            received.add(url)
+        if received != requested:
+            missing = len(requested - received)
+            raise Failure("multiget", f"calendar-multiget omitted {missing} requested event(s)")
 
-    rows: list[tuple] = []
-    for chunk in pool.map(fetch, batches):
-        rows.extend(chunk)
+    if full_sync:
+        removed.extend(url for url in known if url not in listed)
+    removed = list(dict.fromkeys(removed))
 
     added = sum(1 for row in rows if row[0] not in known)
     return {
@@ -640,7 +789,7 @@ def sync(conn, only: str = "", force: bool = False) -> dict:
 
 
 def sync_account(conn, user: str, server: str, only: str, force: bool) -> list[dict]:
-    session = DavSession(user, load_password(user))
+    session = DavSession(user, load_password(user), server)
     found = discover(session, server)
     cached = {
         row[0]: {"ctag": row[1], "token": row[2], "enabled": row[3]}
@@ -663,12 +812,13 @@ def sync_account(conn, user: str, server: str, only: str, force: bool) -> list[d
         if calendar in known_by_calendar:
             known_by_calendar[calendar][url] = etag
 
-    # Calendars run in parallel and so do the multiget batches inside each, all
-    # sharing one pool so the total request concurrency stays bounded.
+    # Calendars run in parallel, with each calendar's multiget batches
+    # sequential inside its worker. This keeps total request concurrency
+    # bounded without workers waiting for tasks queued to their own pool.
     results = []
     with ThreadPoolExecutor(max_workers=SYNC_WORKERS) as pool:
         futures = [
-            pool.submit(fetch_calendar, session, cal, known_by_calendar[cal["url"]], pool, force)
+            pool.submit(fetch_calendar, session, cal, known_by_calendar[cal["url"]], force)
             for cal in targets
         ]
         for cal, future in zip(targets, futures):
@@ -689,7 +839,7 @@ def sync_account(conn, user: str, server: str, only: str, force: bool) -> list[d
             "href=excluded.href, name=excluded.name, color=excluded.color, "
             "account=excluded.account, readonly=excluded.readonly, "
             "synced_at=excluded.synced_at, error=excluded.error",
-            (cal["url"], cal["href"], cal["name"], cal["color"], cal["ctag"],
+            (cal["url"], cal["href"], cal["name"], cal["color"], "",
              "", user, int(cal["readonly"]), now, outcome.get("error", "")),
         )
         if not outcome.get("ok") or outcome.get("skipped"):
@@ -906,7 +1056,7 @@ def base_fields(comp, cal: dict) -> dict:
 
 
 def occurrence(comp, cal: dict, begin: int, finish: int, all_day: bool,
-               rid: str = "") -> dict:
+               rid: str = "", href: str = "") -> dict:
     # DTEND is exclusive in iCalendar and stays exclusive here: a one-day
     # all-day event is start 09-22, end 09-23.
     when = (
@@ -914,10 +1064,14 @@ def occurrence(comp, cal: dict, begin: int, finish: int, all_day: bool,
         if all_day
         else {"start": local_iso(begin), "end": local_iso(finish)}
     )
-    return {**base_fields(comp, cal), "allDay": all_day, "rid": rid, **when}
+    event = {**base_fields(comp, cal), "allDay": all_day, "rid": rid, **when}
+    if href:
+        event["href"] = href
+    return event
 
 
-def expand(ics: str, cal: dict, start: datetime, end: datetime, out: list) -> None:
+def expand(ics: str, cal: dict, start: datetime, end: datetime, out: list,
+           href: str = "") -> None:
     """Expand one calendar object into the occurrences inside [start, end)."""
     parsed = parse_ics(ics)
     if parsed is None:
@@ -938,7 +1092,7 @@ def expand(ics: str, cal: dict, start: datetime, end: datetime, out: list) -> No
             # The override replaces this slot and is emitted below.
             if begin in overrides:
                 return True
-            out.append(occurrence(master, cal, begin, span.get_end(), all_day))
+            out.append(occurrence(master, cal, begin, span.get_end(), all_day, href=href))
             return True
 
         try:
@@ -954,7 +1108,7 @@ def expand(ics: str, cal: dict, start: datetime, end: datetime, out: list) -> No
         rid = comp.get_recurrenceid()
         out.append(occurrence(
             comp, cal, begin, finish, comp.get_dtstart().is_date(),
-            rid=rid.as_ical_string() if rid is not None else str(rid_at),
+            rid=rid.as_ical_string() if rid is not None else str(rid_at), href=href,
         ))
 
 
@@ -1002,7 +1156,7 @@ def visible_calendars(conn) -> dict[str, dict]:
 
 def window_rows(conn, start: datetime, end: datetime, calendars: list[str]):
     sql = (
-        "SELECT calendar, ics, pending FROM objects "
+        "SELECT url, calendar, ics, pending FROM objects "
         "WHERE (open_ended=1 OR (last_end >= ? AND first_start < ?))"
     )
     args: list = [int(start.timestamp()), int(end.timestamp())]
@@ -1028,9 +1182,9 @@ def events(conn, start: datetime, end: datetime, only: list[str]) -> dict:
         }
     out: list = []
     parsed = 0
-    for calendar, ics, pending in window_rows(conn, start, end, wanted):
+    for href, calendar, ics, pending in window_rows(conn, start, end, wanted):
         before = len(out)
-        expand(ics, cals.get(calendar, {}), start, end, out)
+        expand(ics, cals.get(calendar, {}), start, end, out, href)
         # A change of ours still waiting for iCloud: shown, and marked.
         if pending:
             for item in out[before:]:
@@ -1174,11 +1328,20 @@ def wall_in(seconds: int, zone_name: str) -> str:
     return datetime.fromtimestamp(seconds, zone).strftime("%Y-%m-%dT%H:%M:%S")
 
 
-def event_detail(conn, uid: str, rid: str, at: str = "") -> dict:
+def event_detail(conn, uid: str, rid: str, at: str = "", href: str = "") -> dict:
     cals = visible_calendars(conn)
-    row = conn.execute(
-        "SELECT calendar, ics, url, etag FROM objects WHERE uid=? LIMIT 1", (uid,)
-    ).fetchone()
+    if href:
+        row = conn.execute(
+            "SELECT calendar, ics, url, etag FROM objects WHERE uid=? AND url=?",
+            (uid, href),
+        ).fetchone()
+    else:
+        matches = conn.execute(
+            "SELECT calendar, ics, url, etag FROM objects WHERE uid=? LIMIT 2", (uid,)
+        ).fetchall()
+        if len(matches) > 1:
+            raise Failure("ambiguous", "more than one calendar event has that identifier; reopen it from its calendar")
+        row = matches[0] if matches else None
     if not row:
         raise Failure("not-found", f"no event with uid {uid}")
     calendar, ics, url, etag = row
@@ -1282,11 +1445,11 @@ def search(conn, query: str, limit: int) -> dict:
     needle = f"%{query.lower()}%"
     out = []
     rows = conn.execute(
-        "SELECT calendar, ics FROM objects WHERE calendar IN "
+        "SELECT url, calendar, ics FROM objects WHERE calendar IN "
         f"({','.join('?' * len(cals)) or 'NULL'}) AND lower(summary) LIKE ? LIMIT ?",
         [*cals.keys(), needle, limit * 4],
     )
-    for calendar, ics in rows:
+    for href, calendar, ics in rows:
         parsed = parse_ics(ics)
         if parsed is None:
             continue
@@ -1297,6 +1460,7 @@ def search(conn, query: str, limit: int) -> dict:
         out.append(occurrence(
             master, cals.get(calendar, {}), begin, finish,
             master.get_dtstart().is_date(),
+            href=href,
         ))
         if len(out) >= limit:
             break
@@ -1473,7 +1637,7 @@ def sync_contacts(conn) -> dict:
         if server.rstrip("/") != ICLOUD.rstrip("/"):
             continue
         error, people = "", []
-        session = DavSession(user, load_password(user))
+        session = DavSession(user, load_password(user), ICLOUD_CONTACTS)
         try:
             for book in contact_books(session):
                 people.extend(book_people(session, book))
@@ -2164,10 +2328,16 @@ def plan_save(ics: str, request: dict, zones: Zones) -> list[dict]:
     end_series_before(parsed, master, occurrence)
     stamp(master)
     calendar = target or request.get("calendarUrl") or href.rsplit("/", 1)[0] + "/"
-    return [{"method": "PUT", "url": href, "body": clean(parsed).as_ical_string(), "ifMatch": etag},
-            {"method": "PUT", "url": object_url(calendar, new_uid),
+    new_url = object_url(calendar, new_uid)
+    split = {"replacementUrl": new_url}
+    # Create the replacement first. A refusal to shorten the original can at
+    # worst leave two copies; truncating first could permanently lose every
+    # future occurrence if the second request failed.
+    return [{"method": "PUT", "url": new_url,
              "body": clean(fresh).as_ical_string(), "ifNoneMatch": True, "uid": new_uid,
-             "primary": True}]
+             "primary": True, "seriesSplit": split},
+            {"method": "PUT", "url": href, "body": clean(parsed).as_ical_string(),
+             "ifMatch": etag, "seriesSplit": split}]
 
 
 def plan_delete(ics: str, request: dict, zones: Zones) -> list[dict]:
@@ -2214,6 +2384,15 @@ CONFLICT_MESSAGE = ("This event changed on iCloud since it was opened — on ano
 
 def send(session: DavSession, method: str, url: str, body: bytes | None,
          headers: dict) -> tuple[int, dict, bytes]:
+    method = method.upper()
+    preconditions = {key.lower(): value for key, value in headers.items()}
+    if method in ("PUT", "DELETE"):
+        if_match = str(preconditions.get("if-match") or "").strip()
+        if_none_match = str(preconditions.get("if-none-match") or "").strip()
+        creates_only = method == "PUT" and if_none_match == "*"
+        if not if_match and not creates_only:
+            raise Failure("precondition", f"{method} requires If-Match for an existing resource")
+
     host, path = split_url(url)
     sent = {"Authorization": session.headers["Authorization"],
             "User-Agent": session.headers["User-Agent"]}
@@ -2223,8 +2402,12 @@ def send(session: DavSession, method: str, url: str, body: bytes | None,
         try:
             conn.request(method, path, body=body, headers=sent)
             resp = conn.getresponse()
-            return resp.status, {k.lower(): v for k, v in resp.getheaders()}, resp.read(
-                MAX_RESPONSE_BYTES)
+            got = {k.lower(): v for k, v in resp.getheaders()}
+            data = resp.read(MAX_RESPONSE_BYTES + 1)
+            if len(data) > MAX_RESPONSE_BYTES:
+                session._discard_connection(host, conn)
+                raise Failure("response-too-large", "DAV response exceeded the size limit")
+            return resp.status, got, data
         except (http.client.HTTPException, OSError):
             try:
                 conn.close()
@@ -2234,6 +2417,27 @@ def send(session: DavSession, method: str, url: str, body: bytes | None,
             if attempt == 2:
                 raise
     raise Failure("transport", "unreachable")
+
+
+def rollback_series_split(session_for, op: dict, done: list[dict]) -> bool:
+    """Remove a just-created replacement only after a definite 412 refusal.
+
+    The If-Match on the compensating DELETE means a concurrent edit to the
+    replacement is kept. Transport failures are deliberately not rolled back:
+    the original PUT may have reached iCloud even when its reply did not.
+    """
+    split = op.get("seriesSplit") or {}
+    replacement = next((item for item in done
+                        if item["url"] == split.get("replacementUrl")), None)
+    if not replacement or not replacement.get("etag"):
+        return False
+    try:
+        session = session_for(replacement["url"])
+        status, _, _ = send(session, "DELETE", replacement["url"], None,
+                            {"If-Match": replacement["etag"]})
+        return status in (200, 201, 204, 404)
+    except (Failure, OSError, http.client.HTTPException):
+        return False
 
 
 def run_writes(session, ops: list[dict]) -> list[dict]:
@@ -2246,7 +2450,18 @@ def run_writes(session, ops: list[dict]) -> list[dict]:
     session_for = session if callable(session) else (lambda _url: session)
     done = []
     for op in ops:
-        session = session_for(op["url"])
+        split = op.get("seriesSplit")
+        try:
+            session = session_for(op["url"])
+        except Failure as failure:
+            if split and done:
+                if rollback_series_split(session_for, op, done):
+                    raise Failure("write", "the original series could not be changed; "
+                                             "the new series was removed. Sync, reopen, and try again.")
+                raise Failure("partial-write", "the replacement series was created, but the "
+                              "original could not be changed or the replacement could not be "
+                              "removed. Sync and review the calendar before trying again.") from failure
+            raise
         headers = {}
         body = None
         if op["method"] == "PUT":
@@ -2259,6 +2474,13 @@ def run_writes(session, ops: list[dict]) -> list[dict]:
         try:
             status, got, data = send(session, op["method"], op["url"], body, headers)
         except (OSError, http.client.HTTPException) as error:
+            if split:
+                if done:
+                    raise Failure("partial-write", "the replacement series was created, but "
+                                  "iCloud's reply about the original was lost. Sync to check "
+                                  "whether both copies are present before trying again.") from error
+                raise Failure("partial-write", "the connection dropped while creating the new "
+                              "series; it may have reached iCloud. Sync before retrying.") from error
             # Nothing sent yet is a save that can wait; something sent is
             # a plan cut in half, which is said as that.
             if not done:
@@ -2266,12 +2488,23 @@ def run_writes(session, ops: list[dict]) -> list[dict]:
             raise Failure("write", "the connection dropped partway through saving; "
                                    "sync to see what reached iCloud")
         if status == 412:
+            if split and done:
+                if rollback_series_split(session_for, op, done):
+                    raise Failure("conflict", "the original series changed on iCloud; the new "
+                                  "series was removed. Sync, reopen, and try again.")
+                raise Failure("partial-write", "the original series changed on iCloud, and the "
+                              "new series could not be removed. Sync and review the calendar "
+                              "before trying again.")
             raise Failure("conflict", CONFLICT_MESSAGE)
         if op["method"] == "DELETE" and status == 404:
             status = 204  # already gone is gone
         if status not in (200, 201, 204):
             detail = re.sub(r"<[^>]+>", " ", data.decode("utf-8", "replace"))
             detail = re.sub(r"\s+", " ", detail).strip()[:160]
+            if split and done:
+                raise Failure("partial-write", "iCloud did not confirm the original series "
+                              f"change (HTTP {status}); the replacement may remain. Sync and "
+                              "review the calendar before trying again.")
             raise Failure("write", f"iCloud refused the {op['method']} "
                                    f"(HTTP {status}){': ' + detail if detail else ''}")
         done.append({"method": op["method"], "url": op["url"], "etag": got.get("etag", ""),
@@ -2386,6 +2619,11 @@ def account_for(conn, calendar_url: str) -> str:
     if not row or not row[0]:
         raise Failure("not-found", "that calendar is not one omarcal knows")
     return row[0]
+
+
+def account_server(conn, account: str) -> str:
+    row = conn.execute("SELECT server FROM accounts WHERE user=?", (account,)).fetchone()
+    return row[0] if row else ICLOUD
 
 
 # --------------------------------------------------------------------- queue
@@ -2559,7 +2797,7 @@ def send_event(conn, request: dict, deleting: bool) -> dict:
     def session_for(url: str) -> DavSession:
         owner = account_of_url(conn, url) or user
         if owner not in sessions:
-            sessions[owner] = DavSession(owner, load_password(owner))
+            sessions[owner] = DavSession(owner, load_password(owner), account_server(conn, owner))
         return sessions[owner]
 
     try:
@@ -2656,7 +2894,7 @@ PLACE_PROVIDERS = {
     "nominatim": "https://nominatim.openstreetmap.org/search"
                  "?format=jsonv2&addressdetails=1&limit=5&q=",
 }
-PLACES_AGENT = "omarcal (+https://github.com/lancefaul/omarchy-omarcal)"
+PLACES_AGENT = "omarcal (+https://github.com/kabucey/omarchy-omarcal)"
 PLACES_TIMEOUT = 8.0
 
 
@@ -2789,8 +3027,8 @@ def contact_list(conn) -> dict:
 # deadline, and the answer is capped before it is buffered — refused on its
 # declared length, and again on what actually arrives.
 
-RELEASES_API = "https://api.github.com/repos/lancefaul/omarchy-omarcal/releases/latest"
-RELEASES_AGENT = "omarcal (+https://github.com/lancefaul/omarchy-omarcal)"
+RELEASES_API = "https://api.github.com/repos/kabucey/omarchy-omarcal/releases/latest"
+RELEASES_AGENT = "omarcal (+https://github.com/kabucey/omarchy-omarcal)"
 UPDATE_TIMEOUT = 10.0          # seconds, for connecting and for each read
 UPDATE_DEADLINE = 20.0         # seconds, for the whole exchange
 UPDATE_MAX_BYTES = 256 * 1024  # a release answer is a few KB
@@ -2855,6 +3093,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--from", dest="start", default="")
     ap.add_argument("--to", dest="end", default="")
     ap.add_argument("--uid", default="")
+    ap.add_argument("--href", default="")
     ap.add_argument("--rid", default="")
     ap.add_argument("--at", default="")
     ap.add_argument("--id", type=int, default=0)
@@ -2881,7 +3120,21 @@ def main(argv: list[str]) -> int:
     return 0
 
 
+MUTATING_COMMANDS = {
+    "login", "remove-account", "forget-calendar", "set-calendar", "sync",
+    "settings", "contacts-sync", "contacts-forget", "save", "delete",
+    "flush", "pending-dismiss",
+}
+
+
 def dispatch(conn, args) -> dict:
+    if args.command in MUTATING_COMMANDS:
+        with state_mutation_lock(conn):
+            return _dispatch_unlocked(conn, args)
+    return _dispatch_unlocked(conn, args)
+
+
+def _dispatch_unlocked(conn, args) -> dict:
     if args.command == "login":
         if not args.user:
             raise Failure("usage", "--user is required")
@@ -2895,7 +3148,7 @@ def dispatch(conn, args) -> dict:
             password = stored_password(args.user)
         if not password:
             raise Failure("usage", "no password given and none stored")
-        session = DavSession(args.user, password)
+        session = DavSession(args.user, password, args.server)
         found = discover(session, args.server)
         if not os.environ.get("OMARCAL_PASSWORD"):
             store_password(args.user, password)
@@ -2939,6 +3192,66 @@ def dispatch(conn, args) -> dict:
             raise Failure("usage", "--user is required")
         urls = [r[0] for r in conn.execute(
             "SELECT url FROM calendars WHERE account=?", (args.user,))]
+        def belongs_to_account(url: str) -> bool:
+            return any(url.startswith(calendar) for calendar in urls)
+
+        # Clear the keyring first. If secret-tool cannot do it, leave the
+        # account and its cache intact so Disconnect cannot report success
+        # while retaining a usable password.
+        forget_password(args.user)
+
+        pending_rows = conn.execute("SELECT id, request, state FROM pending").fetchall()
+        queued_ids = {pending_id for pending_id, _text, state in pending_rows
+                      if state == "queued"}
+        backups = conn.execute(
+            "SELECT pending_id, url, existed, calendar, etag, ics "
+            "FROM pending_backup ORDER BY pending_id, rowid").fetchall()
+        by_pending: dict[int, list[tuple]] = {}
+        doomed = set()
+        for backup in backups:
+            pending_id, url, _existed, calendar, _etag, _ics = backup
+            by_pending.setdefault(pending_id, []).append(backup)
+            if belongs_to_account(url) or belongs_to_account(calendar):
+                doomed.add(pending_id)
+        for pending_id, text, _state in pending_rows:
+            try:
+                request = json.loads(text)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if any(belongs_to_account(str(request.get(key) or ""))
+                   for key in ("href", "calendarUrl", "targetCalendarUrl")):
+                doomed.add(pending_id)
+        remaining_queued_ids = queued_ids - doomed
+
+        # Remove optimistic cache changes made only for the cancelled queue
+        # entries. Restore unaffected calendars from their before-images in
+        # reverse order, unless a newer queued write still owns that row.
+        for pending_id in sorted(doomed, reverse=True):
+            if pending_id not in queued_ids:
+                continue  # conflicts were already rolled back by flush_pending
+            for _id, url, existed, calendar, etag, ics in reversed(by_pending.get(pending_id, [])):
+                if belongs_to_account(url) or belongs_to_account(calendar):
+                    continue
+                newer = any(
+                    other_id not in doomed and other_id in queued_ids and other_id > pending_id
+                    and any(other_url == url for _other_id, other_url, *_rest in rows)
+                    for other_id, rows in by_pending.items()
+                )
+                if newer:
+                    continue
+                if existed:
+                    still_queued = any(
+                        other_id in remaining_queued_ids
+                        and any(other_url == url for _other_id, other_url, *_rest in rows)
+                        for other_id, rows in by_pending.items()
+                    )
+                    put_row(conn, url, ics, etag, int(still_queued))
+                else:
+                    conn.execute("DELETE FROM objects WHERE url=?", (url,))
+        if doomed:
+            ids = [(pending_id,) for pending_id in sorted(doomed)]
+            conn.executemany("DELETE FROM pending_backup WHERE pending_id=?", ids)
+            conn.executemany("DELETE FROM pending WHERE id=?", ids)
         for url in urls:
             conn.execute("DELETE FROM objects WHERE calendar=?", (url,))
         conn.execute("DELETE FROM calendars WHERE account=?", (args.user,))
@@ -2948,7 +3261,6 @@ def dispatch(conn, args) -> dict:
         conn.execute("DELETE FROM contact_state WHERE account=?", (args.user,))
         removed = conn.execute("DELETE FROM accounts WHERE user=?", (args.user,)).rowcount
         conn.commit()
-        forget_password(args.user)
         reclaim(conn)
         return {"ok": True, "removed": bool(removed), "calendars": len(urls)}
 
@@ -3004,7 +3316,7 @@ def dispatch(conn, args) -> dict:
     if args.command == "event":
         if not args.uid:
             raise Failure("usage", "--uid is required")
-        return event_detail(conn, args.uid, args.rid, args.at)
+        return event_detail(conn, args.uid, args.rid, args.at, args.href)
 
     if args.command == "search":
         if not args.query:
@@ -3085,7 +3397,8 @@ def dispatch(conn, args) -> dict:
     if args.command == "watch":
         interval = args.interval or read_settings(conn)["refreshMinutes"] * 60
         while True:
-            outcome = sync(conn)
+            with state_mutation_lock(conn):
+                outcome = sync(conn)
             moved = [c for c in outcome["calendars"]
                      if c.get("added") or c.get("changed") or c.get("removedCount")]
             print(json.dumps({"ok": True, "changed": bool(moved), "calendars": moved}),

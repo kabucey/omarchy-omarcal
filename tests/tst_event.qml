@@ -139,6 +139,13 @@ TestCase {
     compare(Logic.mergeOccurrence(null, { uid: "B" }).uid, "B")
   }
 
+  function test_merge_keeps_same_uid_details_bound_to_the_clicked_resource() {
+    var seed = { uid: "same", href: "https://x/a/event.ics", start: "2026-09-01" }
+    var other = { uid: "same", href: "https://x/b/event.ics", title: "Other calendar" }
+    compare(Logic.mergeOccurrence(seed, other).href, seed.href)
+    compare(Logic.mergeOccurrence(seed, other).title, undefined)
+  }
+
   // iCloud writes sms:// and message:// URLs that a browser cannot use.
   function test_web_links() {
     verify(Logic.isWebLink("https://example.com/x"))

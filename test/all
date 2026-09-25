@@ -4,15 +4,25 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 export QT_QPA_PLATFORM=offscreen QML_XHR_ALLOW_FILE_READ=1
-runner=/usr/lib/qt6/bin/qmltestrunner
-[ -x "$runner" ] || { echo "qmltestrunner not found at $runner"; exit 127; }
+runner=$(command -v qmltestrunner || true)
+if [ -z "$runner" ]; then
+  for candidate in /usr/lib/qt6/bin/qmltestrunner /usr/lib/qt5/bin/qmltestrunner; do
+    if [ -x "$candidate" ]; then runner=$candidate; break; fi
+  done
+fi
+[ -n "$runner" ] || { echo "qmltestrunner not found on PATH or in the Qt system directories"; exit 127; }
 
 status=0
 for suite in tests/tst_*.qml; do
   printf '\n== %s\n' "$suite"
   output=$("$runner" -input "$suite" 2>&1)
+  runner_status=$?
   grep -E 'FAIL|Totals' <<<"$output"
   grep -q 'FAIL' <<<"$output" && status=1
+  if [ "$runner_status" -ne 0 ]; then
+    echo "qmltestrunner exited with status $runner_status"
+    status=1
+  fi
 done
 
 # The helper's own suite, offline.

@@ -43,7 +43,7 @@ so another provider is one entry plus a chip, and more are coming.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/lancefaul/omarchy-omarcal.git --enable
+omarchy plugin add https://github.com/kabucey/omarchy-omarcal.git --enable
 ```
 
 For local development, link the checkout into the plugins directory instead,

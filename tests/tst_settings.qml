@@ -39,12 +39,57 @@ TestCase {
     compare(Logic.refreshLabel(0), "Never")
   }
 
-  function test_clock_presets_start_with_the_shipped_face() {
+  function test_clock_presets_start_with_stock_omarchy_face() {
     var presets = Logic.clockPresets()
-    compare(presets[0].format, "dddd, MMMM d, yyyy '•' hh:mm:ss AP")
+    compare(presets[0].format, "dddd HH:mm")
     compare(presets[0].format, Logic.settingDefault("format"))
     for (var i = 0; i < presets.length; i++)
       verify(presets[i].label.length > 0 && presets[i].format.length > 0)
+  }
+
+  function test_clock_rings_match_stock_options_and_order() {
+    compare(Logic.clockFormats(false), [
+      "dddd HH:mm", "dddd h:mm AP", "HH:mm", "h:mm AP",
+      "ddd d MMM HH:mm", "ddd d MMM h:mm AP",
+      "d MMMM 'W'ww yyyy", "yyyy-MM-dd HH:mm"
+    ])
+    compare(Logic.clockFormats(true), [
+      "HH\n—\nmm", "h\n—\nmm\nAP", "dd\nMMM\n'W'ww\n''yy", "HH\nmm"
+    ])
+  }
+
+  function test_custom_and_alternate_formats_follow_presets_once() {
+    var ring = Logic.clockFormatRing("personal current", "personal alternate", ["first", "second"])
+    compare(ring, ["first", "second", "personal alternate", "personal current"])
+
+    // A customized value that already matches a built-in choice is not
+    // repeated at the end of the ring.
+    compare(Logic.clockFormatRing("second", "second", ["first", "second"]), ["first", "second"])
+  }
+
+  function test_unknown_clock_face_cycles_from_the_top() {
+    var ring = ["first", "second", "third"]
+    compare(Logic.nextClockFormat(ring, "hand-written format"), "first")
+    compare(Logic.nextClockFormat(ring, "third"), "first")
+    compare(Logic.nextClockFormat(ring, "first"), "second")
+  }
+
+  function test_pending_setting_write_survives_an_overlapping_status_read() {
+    compare(Logic.mergePendingSettings(
+      { format: "stored", timeFormat: "24h" },
+      { format: "new choice" }, true),
+      { format: "new choice", timeFormat: "24h" })
+    compare(Logic.mergePendingSettings(
+      { format: "stored", timeFormat: "24h" },
+      { format: "stale optimistic" }, false),
+      { format: "stored", timeFormat: "24h" })
+  }
+
+  function test_status_started_during_write_stays_stale_after_queue_drains() {
+    verify(Logic.statusSettingsNeedOverlay(4, 4, true, false))
+    verify(Logic.statusSettingsNeedOverlay(4, 5, false, false))
+    verify(Logic.statusSettingsNeedOverlay(5, 5, false, true))
+    verify(!Logic.statusSettingsNeedOverlay(5, 5, false, false))
   }
 
   // Two faces that render the same are one face with two names, and the
@@ -128,6 +173,9 @@ TestCase {
     compare(d.timeFormat, "12h")
     compare(d.showWeekNumbers, false)
     compare(d.refreshMinutes, 15)
-    compare(d.verticalFormat, "HH\nmm\nss")
+    compare(d.format, "dddd HH:mm")
+    compare(d.formatAlt, "d MMMM 'W'ww yyyy")
+    compare(d.verticalFormat, "HH\n—\nmm")
+    compare(d.verticalFormatAlt, "dd\nMMM\n'W'ww\n''yy")
   }
 }

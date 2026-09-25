@@ -21,8 +21,10 @@
     "allowMultiple": false,
     "defaultSection": "center",
     "defaults": {
-      "format": "dddd, MMMM d, yyyy '\u2022' hh:mm:ss AP",
-      "verticalFormat": "HH\nmm\nss",
+      "format": "dddd HH:mm",
+      "formatAlt": "d MMMM 'W'ww yyyy",
+      "verticalFormat": "HH\n—\nmm",
+      "verticalFormatAlt": "dd\nMMM\n'W'ww\n''yy",
       "weekStartDay": 0,
       "timeFormat": "12h",
       "showWeekNumbers": false,

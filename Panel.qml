@@ -34,11 +34,10 @@ Panel {
   property string selectedKey: todayKey
 
   // Preferences live in the helper's own store, because shell.json belongs to
-  // the shell and a plugin cannot write it. Until the first `status` lands,
-  // the manifest defaults that the shell did write stand in, so the month is
-  // drawn once with the right week start rather than redrawn a moment later.
+  // the shell and a plugin cannot write it. Read its optimistic copy even
+  // before the first `status`, so a newly chosen setting appears at once.
   function pref(name, fallback) {
-    if (service && service.settingsLoaded) return service.setting(name, fallback)
+    if (service && typeof service.setting === "function") return service.setting(name, fallback)
     return setting(name, fallback)
   }
 
@@ -69,7 +68,8 @@ Panel {
     cancelEdit()
     viewerSeed = event
     viewerOpen = true
-    if (service) service.loadEvent(event.uid, event.rid || "", event.allDay ? "" : String(event.start || ""))
+    if (service) service.loadEvent(event.uid, event.rid || "",
+      event.allDay ? "" : String(event.start || ""), event.href || "")
   }
 
   function closeEvent() {
@@ -622,11 +622,12 @@ Panel {
   property string setupPassword: ""
   property bool setupChangingPassword: false
   property bool helpOpen: false
+  property int setupRequestCounter: 0
+  property int setupActiveRequestId: -1
 
   // What the calendar switches are set to, against what is stored. Seeded
   // when the list arrives, then the person's own choices until they save.
   property var setupSelection: ({})
-  property string setupNotice: ""
   // True once this form has something to list: the account being edited
   // already has calendars, a new one has none until it connects. Without it
   // the list is bound to whatever account is already set up, and Add offers
@@ -696,7 +697,6 @@ Panel {
     confirmRemove = false
     pendingForget = null
     service.removeAccount(setupUser)
-    closeSetup()
   }
 
   function saveSelection() {
@@ -719,14 +719,19 @@ Panel {
     searchOpen = false
     setupEditing = false
     setupChangingPassword = false
+    setupActiveRequestId = -1
     setupUser = ""
     setupPassword = ""
-    setupNotice = ""
     setupSelection = ({})
     setupHasCalendars = false
     confirmRemove = false
     pendingForget = null
-    if (service) service.hidePassword()
+    if (service) {
+      service.addError = ""
+      service.addErrorRequestId = -1
+      service.removeError = ""
+      service.hidePassword()
+    }
     setupOpen = true
   }
 
@@ -737,13 +742,18 @@ Panel {
     searchOpen = false
     setupEditing = true
     setupChangingPassword = false
+    setupActiveRequestId = -1
     setupUser = service ? service.account : ""
     setupPassword = ""
-    setupNotice = ""
     setupHasCalendars = true
     confirmRemove = false
     pendingForget = null
-    if (service) service.hidePassword()
+    if (service) {
+      service.addError = ""
+      service.addErrorRequestId = -1
+      service.removeError = ""
+      service.hidePassword()
+    }
     seedSelection()
     setupOpen = true
   }
@@ -756,9 +766,9 @@ Panel {
 
   function closeSetup() {
     setupOpen = false
+    setupActiveRequestId = -1
     setupChangingPassword = false
     setupPassword = ""
-    setupNotice = ""
     setupSelection = ({})
     setupHasCalendars = false
     confirmRemove = false
@@ -767,9 +777,11 @@ Panel {
   }
 
   function connectAccount() {
-    if (!canConnect || !service) return
-    setupNotice = ""
-    service.addAccount(setupUser.trim(), setupPreset.server, setupPassword)
+    if (!canConnect || !service || service.addingAccount) return
+    setupRequestCounter += 1
+    setupActiveRequestId = setupRequestCounter
+    service.addAccount(setupUser.trim(), setupPreset.server, setupPassword,
+                       setupActiveRequestId)
   }
 
   // Which view the month column shows. Only Month draws today; Day and Week
@@ -999,6 +1011,39 @@ Panel {
       color: Color.popups.background
       radius: Style.cornerRadius
       borderSpec: Border.controlSpec("normal", root.foreground, Color.accent)
+    }
+  }
+
+  // One quiet action at the pointer. Keeping this as the same outlined
+  // surface and row used by every picker makes a right-click feel native to
+  // the panel rather than like a second menu system bolted onto the month.
+  component DayMenu: MenuPopup {
+    id: dayMenu
+    property string dayKey: ""
+
+    width: Style.space(150)
+    focus: true
+    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutsideParent
+
+    function openFor(key, pointerX, pointerY) {
+      dayKey = key
+      x = pointerX
+      y = pointerY
+      open()
+    }
+
+    contentItem: Column {
+      MenuRow {
+        width: dayMenu.availableWidth
+        label: "New Event"
+        enabled: root.newEventCalendar !== ""
+        opacity: enabled ? 1.0 : 0.4
+        onActivated: {
+          root.selectedKey = dayMenu.dayKey
+          dayMenu.close()
+          root.startNew()
+        }
+      }
     }
   }
 
@@ -2150,6 +2195,7 @@ Panel {
         width: parent.width
         wrapMode: dayEntry.wrap ? Text.WordWrap : Text.NoWrap
         elide: dayEntry.wrap ? Text.ElideNone : Text.ElideRight
+        textFormat: Text.PlainText
         // Still collapsed to one logical line first: iCloud writes titles
         // across several, and wrapping is meant to follow the column's width
         // rather than whatever the server happened to put a newline in.
@@ -2169,6 +2215,7 @@ Panel {
           width: entry.width
           wrapMode: dayEntry.wrap ? Text.WordWrap : Text.NoWrap
           elide: dayEntry.wrap ? Text.ElideNone : Text.ElideRight
+          textFormat: Text.PlainText
           text: modelData
           color: root.subdued
           font.family: root.fontFamily
@@ -2333,11 +2380,8 @@ Panel {
     return event && event.color ? event.color : Color.accent
   }
 
-  // The form has no way of knowing the helper succeeded; the service does.
-  // Without this it sat there after a successful save, which reads as though
-  // nothing happened.
-  // A connection that worked says so and leaves the form open: the calendars
-  // it just found are the point, and they are chosen here.
+  // The service emits success only after the helper has saved the account.
+  // The request id keeps a late result from dismissing a different form.
   property Connections settingsWatch: Connections {
     target: root.service
     function onSettingsLoadedChanged() { root.seedView() }
@@ -2360,13 +2404,13 @@ Panel {
         root.seedSelection()
     }
 
-    function onAccountAdded() {
-      root.setupChangingPassword = false
-      root.setupPassword = ""
-      root.setupNotice = "Connected."
-      root.setupHasCalendars = true
-      root.seedSelection()
+    function onAccountAdded(requestId) {
+      if (!Logic.accountRequestMatches(root.setupActiveRequestId, requestId)) return
+      if (root.setupEditing) root.saveSelection()
+      else root.closeSetup()
     }
+
+    function onRemoved() { root.closeSetup() }
   }
 
   onOpenedChanged: {
@@ -3330,7 +3374,8 @@ Panel {
                 width: parent.width
                 wrapMode: Text.WordWrap
                 textFormat: Text.PlainText
-                text: Qt.formatDateTime(root.today, root.clockFormat)
+                text: Qt.formatDateTime(root.today, root.clockFormat.replace(
+                  /ww/g, Logic.isoWeekLiteral(root.todayKey)))
                 color: root.subdued
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -3482,6 +3527,7 @@ Panel {
               TextField {
                 width: parent.width
                 height: root.fieldHeight
+                enabled: !(root.service && root.service.addingAccount)
                 text: root.setupUser
                 foreground: root.foreground
                 onTextChanged: root.setupUser = text
@@ -3536,6 +3582,7 @@ Panel {
                   // While one is held the box shows it, masked, and is not
                   // typed into — the key beside it is how it gets replaced.
                   enabled: !root.setupPasswordHeld
+                           && !(root.service && root.service.addingAccount)
                   password: !root.setupPasswordHeld || !root.passwordRevealed
                   text: root.setupPasswordHeld
                     ? (root.passwordRevealed ? root.service.revealedPassword
@@ -3607,39 +3654,22 @@ Panel {
               onClicked: root.connectAccount()
             }
 
-            // A connection that worked says so and stays put; the calendars
-            // it found are chosen below.
-            Row {
-              visible: root.setupNotice !== ""
-              spacing: Style.spacing.xs
-
-              Text {
-                anchors.verticalCenter: parent.verticalCenter
-                textFormat: Text.PlainText
-                text: "\uf00c"
-                color: root.stored
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-
-              Text {
-                anchors.verticalCenter: parent.verticalCenter
-                text: root.setupNotice
-                color: root.stored
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-            }
-
             Text {
               width: sidebar.width
               wrapMode: Text.WordWrap
-              visible: text !== ""
-              // The server's own words when it refused, ours when the form is
-              // not filled in yet — and nothing at all until something is.
-              text: root.service && root.service.addError
-                ? root.service.addError
-                : (root.setupUser || root.setupPassword ? root.setupProblem : "")
+              visible: root.setupOpen && text !== ""
+              textFormat: Text.PlainText
+              // Submission state prevents cleared credentials from becoming
+              // a validation error while the successful result closes the form.
+              text: Logic.accountSetupMessage({
+                open: root.setupOpen,
+                hasInput: !!(root.setupUser || root.setupPassword),
+                problem: root.setupProblem,
+                activeRequestId: root.setupActiveRequestId,
+                addError: root.service ? root.service.addError : "",
+                addErrorRequestId: root.service ? root.service.addErrorRequestId : -1,
+                removeError: root.service ? root.service.removeError : ""
+              })
               color: root.danger
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -4226,6 +4256,7 @@ Panel {
                               anchors.verticalCenter: parent.verticalCenter
                               width: root.cellWidth - Style.space(20)
                               elide: Text.ElideRight
+                              textFormat: Text.PlainText
                               text: Logic.singleLine(bucket.timed[index].title)
                               color: root.foreground
                               font.family: root.fontFamily
@@ -4249,9 +4280,19 @@ Panel {
                         }
                       }
 
+                      DayMenu {
+                        id: monthDayMenu
+                      }
+
                       MouseArea {
+                        id: monthDayArea
                         anchors.fill: parent
-                        onClicked: root.selectedKey = modelData.key
+                        acceptedButtons: Qt.LeftButton | Qt.RightButton
+                        onClicked: function (mouse) {
+                          root.selectedKey = modelData.key
+                          if (mouse.button === Qt.RightButton)
+                            monthDayMenu.openFor(modelData.key, mouse.x, mouse.y)
+                        }
                       }
                     }
                   }
@@ -4281,6 +4322,7 @@ Panel {
                       anchors.rightMargin: Style.spacing.sm
                       verticalAlignment: Text.AlignVCenter
                       elide: Text.ElideRight
+                      textFormat: Text.PlainText
                       // A bar continuing from the previous week reads as one.
                       text: (modelData.continuesBefore ? "◂ " : "")
                             + Logic.singleLine(modelData.event.title)
@@ -4539,15 +4581,9 @@ Panel {
 
           // ------------------------------------------------ the week rail
           //
-          // Days down, hours across — the other way round from every calendar
-          // that ships with anything. A day *is* a length of time, so it is
-          // drawn as one: seven timelines stacked, and the shape of the week
-          // readable by running your eye down the left of them.
-          //
-          // The pay-off is overlap. Laid out in columns, two appointments at
-          // once halve a day's width and a third makes it unreadable; laid
-          // out in rows they stack, so a busy day grows taller and every
-          // event keeps its full length.
+          // The familiar calendar geometry: days are columns, hours are rows.
+          // It shares the day view's time window and event-lane arithmetic,
+          // so changing working hours affects both views in the same way.
 
           Column {
             id: weekView
@@ -4555,124 +4591,212 @@ Panel {
             width: calendarColumn.width
             spacing: 0
 
-            // Wide enough for "SAT 12" with air after it.
-            readonly property int dayGutter: Style.space(56)
-            // Where the date bubbles sit, so the week's number can be put
-            // over them and every row lines up under it.
-            readonly property int bubbleCentre:
-              Style.spacing.sm + root.weekdayTagWidth + Style.spacing.xs
-              + Math.round(root.bubbleSize / 2)
-
-            // A light week should use the room it has rather than huddle at
-            // the top of it. What the rows want comes from the events, not
-            // from the rows — a row about to be stretched cannot also be what
-            // decides the stretching — and whatever is left over is shared
-            // out evenly. A week too tall to fit gets nothing and scrolls.
-            readonly property int naturalHeight:
-              Logic.weekNaturalRows(root.weekKeys, root.buckets) * root.slotPitch
-              + root.weekKeys.length * root.ruleGap
-            readonly property int rowBonus: Math.max(
-              0, Math.floor((weekRail.height - naturalHeight)
-                            / Math.max(1, root.weekKeys.length)))
-            readonly property int railWidth: calendarColumn.width - dayGutter
-            // An hour of margin either side of the day, so the first and
-            // last marks can straddle their tick like the rest, and an event
-            // that spills out of the day has somewhere to show it.
-            readonly property var rail: Logic.railWindow(root.dayWindow)
-            readonly property int tickStep: Logic.hourTickStep(
-              railWidth, root.hourLabelWidth, rail.hours)
+            readonly property int dayWidth:
+              Math.floor((calendarColumn.width - root.hourGutter) / 7)
+            readonly property int timetableWidth: dayWidth * 7
+            readonly property int hourHeight: Math.max(
+              root.hourHeight,
+              Math.floor((weekRail.height - root.railTop)
+                         / Math.max(1, root.dayWindow.hours)))
 
             Item { width: 1; height: root.halfRuleGap }
 
-            // The clock, along the top. Ticks every hour, named as often as
-            // they will fit without touching.
+            // The weekday and date are one compact heading per column.
             Item {
-              id: weekHours
+              id: weekDaysHeader
               width: calendarColumn.width
-              implicitHeight: Math.max(root.captionLine, weekNumber.implicitHeight)
+              height: root.controlSize
 
-              // The gutter's own heading, in the same column and the same
-              // voice as the day names under it: a quiet three-letter tag,
-              // then the number it belongs to.
               Text {
-                x: Style.spacing.sm
+                width: root.hourGutter - Style.spacing.sm
                 anchors.verticalCenter: parent.verticalCenter
-                width: root.weekdayTagWidth
+                horizontalAlignment: Text.AlignRight
                 textFormat: Text.PlainText
-                text: "WK#"
+                text: "W" + Logic.isoWeekNumber(root.weekKeys[0])
                 color: root.subdued
                 font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                font.weight: Font.DemiBold
+                font.pixelSize: Style.font.caption
               }
 
-              // The week's own number, over the dates it numbers. Lit rather
-              // than subdued: in a week view the week is the subject, not a
-              // note in the margin the way it is on a month.
-              Text {
-                id: weekNumber
-                x: weekView.bubbleCentre - Math.round(width / 2)
-                anchors.verticalCenter: parent.verticalCenter
-                textFormat: Text.PlainText
-                text: Logic.isoWeekNumber(root.weekKeys[0])
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                font.bold: true
-              }
-
-              // Every hour the day covers, ends included, and every one of
-              // them centred on its own tick. The margins are unnamed: they
-              // belong to yesterday and tomorrow.
-              Repeater {
-                model: root.dayWindow.hours + 1
-
-                Text {
-                  required property int index
-                  readonly property int hour: root.dayWindow.from + index
-                  visible: index === root.dayWindow.hours
-                           || index % weekView.tickStep === 0
-                  x: weekView.dayGutter
-                     + Logic.hourAcross(hour, weekView.railWidth, weekView.rail)
-                     - Math.round(width / 2)
-                  anchors.verticalCenter: parent.verticalCenter
-                  width: root.hourLabelWidth
-                  horizontalAlignment: Text.AlignHCenter
-                  textFormat: Text.PlainText
-                  text: Logic.hourLabels(root.timeFormat)[((hour % 24) + 24) % 24]
-                  color: root.subdued
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  font.weight: Font.DemiBold
-                }
-              }
-            }
-
-            Item { width: 1; height: root.halfRuleGap }
-
-            Rule { width: calendarColumn.width }
-
-            Scroller {
-              id: weekRail
-              width: calendarColumn.width
-              // What the month's grid would have taken, less the clock and
-              // its rule above this — so the card is the same height in every
-              // view and switching between them does not resize it.
-              height: Math.max(root.hourHeight * 6,
-                               root.cellHeight * 6 - weekHours.height
-                               - root.ruleGap)
-              contentHeight: weekRows.implicitHeight
-
-              Column {
-                id: weekRows
-                width: weekRail.contentWidth
+              Row {
+                x: root.hourGutter
                 spacing: 0
 
                 Repeater {
                   model: root.weekKeys
 
+                  Rectangle {
+                    id: weekDayHead
+                    required property string modelData
+                    readonly property bool isToday: modelData === root.todayKey
+                    readonly property bool isSelected: modelData === root.selectedKey
+                    width: weekView.dayWidth
+                    height: weekDaysHeader.height
+                    color: isSelected ? Style.selectedFill : "transparent"
+
+                    Text {
+                      anchors.centerIn: parent
+                      textFormat: Text.PlainText
+                      text: Logic.weekDayHeader(weekDayHead.modelData)
+                      color: weekDayHead.isToday ? Color.accent : root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      font.weight: weekDayHead.isToday || weekDayHead.isSelected
+                        ? Font.Bold : Font.DemiBold
+                    }
+
+                    DayMenu { id: weekHeadMenu }
+
+                    MouseArea {
+                      anchors.fill: parent
+                      acceptedButtons: Qt.LeftButton | Qt.RightButton
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: function (mouse) {
+                        root.selectedKey = weekDayHead.modelData
+                        if (mouse.button === Qt.RightButton)
+                          weekHeadMenu.openFor(weekDayHead.modelData, mouse.x, mouse.y)
+                      }
+                    }
+                  }
+                }
+              }
+            }
+
+            Rule { width: calendarColumn.width }
+
+            // All-day events sit outside the clock and retain their spans
+            // across adjacent day columns.
+            Item {
+              id: weekAllDayBand
+              visible: root.weekLanes > 0
+              width: calendarColumn.width
+              height: visible ? root.weekLanes * root.slotPitch + root.ruleGap : 0
+
+              Text {
+                width: root.hourGutter - Style.spacing.sm
+                y: Math.round(root.ruleGap / 2)
+                horizontalAlignment: Text.AlignRight
+                textFormat: Text.PlainText
+                text: "all-day"
+                color: root.subdued
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Repeater {
+                model: root.weekBars
+
+                Rectangle {
+                  required property var modelData
+                  x: root.hourGutter + modelData.startCol * weekView.dayWidth + 1
+                  y: Math.round(root.ruleGap / 2) + modelData.lane * root.slotPitch
+                  width: modelData.span * weekView.dayWidth - 2
+                  height: root.slotHeight
+                  radius: Style.cornerRadius > 0 ? Style.cornerRadius : Style.space(3)
+                  color: Util.alpha(root.colorOf(modelData.event), 0.30)
+
+                  Text {
+                    anchors.fill: parent
+                    anchors.leftMargin: Style.spacing.sm
+                    anchors.rightMargin: Style.spacing.sm
+                    verticalAlignment: Text.AlignVCenter
+                    elide: Text.ElideRight
+                    textFormat: Text.PlainText
+                    text: (modelData.continuesBefore ? "◂ " : "")
+                          + Logic.singleLine(modelData.event.title)
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.openEvent(modelData.event)
+                  }
+                }
+              }
+
+              Rule { width: parent.width; anchors.bottom: parent.bottom }
+            }
+
+            Scroller {
+              id: weekRail
+              width: calendarColumn.width
+              height: Math.max(root.hourHeight * 6,
+                               root.cellHeight * 6 - weekDaysHeader.height
+                               - weekAllDayBand.height - root.ruleGap)
+              contentHeight: weekBody.height
+              interactive: contentHeight > height
+
+              function toOpeningHour() {
+                var blocks = []
+                for (var i = 0; i < root.weekKeys.length; i++) {
+                  var bucket = root.buckets[root.weekKeys[i]] || ({ timed: [] })
+                  blocks = blocks.concat(Logic.layoutTimed(bucket.timed || [], root.weekKeys[i]))
+                }
+                var hour = Math.max(root.dayWindow.from, Logic.openingHour(blocks))
+                contentY = Math.min(
+                  Math.max(0, contentHeight - height),
+                  Logic.hourOffset(hour - root.dayWindow.from, weekView.hourHeight))
+              }
+
+              Component.onCompleted: toOpeningHour()
+
+              Connections {
+                target: root
+                function onSelectedKeyChanged() {
+                  if (root.viewMode === "Week") Qt.callLater(weekRail.toOpeningHour)
+                }
+                function onViewModeChanged() {
+                  if (root.viewMode === "Week") Qt.callLater(weekRail.toOpeningHour)
+                }
+              }
+
+              Item {
+                id: weekBody
+                width: weekRail.contentWidth
+                height: weekView.hourHeight * root.dayWindow.hours + root.railTop
+
+                // Hour labels and rules run across all seven day columns.
+                Repeater {
+                  model: root.dayWindow.hours + 1
+
                   Item {
-                    id: dayRow
+                    required property int index
+                    readonly property int hour: root.dayWindow.from + index
+                    y: root.railTop + index * weekView.hourHeight
+                    width: weekBody.width
+                    height: weekView.hourHeight
+
+                    Rectangle {
+                      x: root.hourGutter
+                      width: weekView.timetableWidth
+                      height: 1
+                      color: root.hairline
+                      opacity: 0.35
+                    }
+
+                    Text {
+                      width: root.hourGutter - Style.spacing.sm
+                      y: -Math.round(root.captionLine / 2)
+                      horizontalAlignment: Text.AlignRight
+                      textFormat: Text.PlainText
+                      text: Logic.hourLabels(root.timeFormat)[hour % 24]
+                      color: root.subdued
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+                }
+
+                // Seven equal day lanes, each using the day view's vertical
+                // event geometry and splitting overlaps only within itself.
+                Repeater {
+                  model: root.weekKeys
+
+                  Item {
+                    id: weekDay
                     required property string modelData
                     required property int index
                     readonly property bool isToday: modelData === root.todayKey
@@ -4681,205 +4805,84 @@ Panel {
                       root.buckets[modelData] || ({ allDay: [], timed: [] })
                     readonly property var blocks:
                       Logic.layoutTimed(bucket.timed, modelData)
-                    readonly property int depth:
-                      Logic.dayDepth(bucket.allDay.length, blocks)
 
-                    width: weekRows.width
-                    implicitHeight: depth * root.slotPitch + root.ruleGap
-                                    + weekView.rowBonus
+                    x: root.hourGutter + index * weekView.dayWidth
+                    y: root.railTop
+                    width: weekView.dayWidth
+                    height: weekView.hourHeight * root.dayWindow.hours
+                    clip: true
 
-                    // The weekend's lighter ground, and the selected day's
-                    // lighter still — the same two the month uses.
                     Rectangle {
                       anchors.fill: parent
-                      color: dayRow.isSelected ? Style.selectedFill
-                           : Logic.isWeekend(Logic.weekdayOf(dayRow.modelData))
+                      color: weekDay.isSelected ? Style.selectedFill
+                           : Logic.isWeekend(Logic.weekdayOf(weekDay.modelData))
                              ? root.weekendFill : "transparent"
                     }
 
-                    // The margins, dimmed: what is drawn there is yesterday
-                    // and tomorrow, and should not read as part of this row.
                     Rectangle {
-                      x: weekView.dayGutter
-                      width: Logic.hourAcross(root.dayWindow.from,
-                                              weekView.railWidth, weekView.rail)
-                      height: dayRow.height
-                      color: Color.popups.background
-                      opacity: 0.55
+                      width: 1
+                      height: parent.height
+                      color: root.hairline
+                      opacity: 0.25
                     }
 
-                    Rectangle {
-                      x: weekView.dayGutter
-                         + Logic.hourAcross(root.dayWindow.to,
-                                            weekView.railWidth, weekView.rail)
-                      width: weekView.railWidth - x + weekView.dayGutter
-                      height: dayRow.height
-                      color: Color.popups.background
-                      opacity: 0.55
-                    }
-
-                    // The hour grid, behind everything the day holds. The
-                    // day's own two ends are drawn like the hours between
-                    // them, which is what the margins made room for.
-                    Repeater {
-                      model: root.dayWindow.hours + 1
-
-                      Rectangle {
-                        required property int index
-                        x: weekView.dayGutter
-                           + Logic.hourAcross(root.dayWindow.from + index,
-                                              weekView.railWidth, weekView.rail)
-                        y: 0
-                        width: 1
-                        height: dayRow.height
-                        color: root.hairline
-                        opacity: index === 0 || index === root.dayWindow.hours
-                          ? 0.5 : index % weekView.tickStep === 0 ? 0.35 : 0.15
-                      }
-                    }
-
-                    // The day, named and numbered, with today in its bubble.
-                    Row {
-                      x: Style.spacing.sm
-                      y: Math.round((root.slotHeight - root.bubbleSize) / 2)
-                        + Math.round(root.ruleGap / 2)
-                      spacing: Style.spacing.xs
-
-                      Text {
-                        anchors.verticalCenter: parent.verticalCenter
-                        width: root.weekdayTagWidth
-                        textFormat: Text.PlainText
-                        text: Logic.weekdayLabels(
-                          Logic.weekdayOf(dayRow.modelData), 3)[0].toUpperCase()
-                        color: root.subdued
-                        font.family: root.fontFamily
-                        // The day's name is the same size as its number: they
-                        // are one label in two parts, not a label and a note.
-                        font.pixelSize: Style.font.bodySmall
-                        font.weight: Font.DemiBold
-                      }
-
-                      Rectangle {
-                        anchors.verticalCenter: parent.verticalCenter
-                        width: root.bubbleSize
-                        height: root.bubbleSize
-                        radius: width / 2
-                        color: dayRow.isToday ? Color.accent : "transparent"
-
-                        Text {
-                          anchors.centerIn: parent
-                          textFormat: Text.PlainText
-                          text: Logic.parseKey(dayRow.modelData).d
-                          color: dayRow.isToday ? Color.popups.background
-                                                : root.foreground
-                          font.family: root.fontFamily
-                          font.pixelSize: Style.font.bodySmall
-                          font.weight: dayRow.isToday || dayRow.isSelected
-                            ? Font.Bold : Font.Normal
-                        }
-                      }
-                    }
+                    DayMenu { id: weekColumnMenu }
 
                     MouseArea {
                       anchors.fill: parent
+                      acceptedButtons: Qt.LeftButton | Qt.RightButton
                       cursorShape: Qt.PointingHandCursor
-                      onClicked: root.selectedKey = dayRow.modelData
-                    }
-
-                    // All-day events take the top rows, the whole day wide,
-                    // because that is exactly how long they are.
-                    Repeater {
-                      model: dayRow.bucket.allDay
-
-                      Rectangle {
-                        required property var modelData
-                        required property int index
-                        readonly property var flow:
-                          Logic.eventOverflow(modelData, dayRow.modelData)
-                        readonly property var box: Logic.blockSpan(
-                          Logic.spilledSpan(root.dayWindow.startMinute,
-                                            root.dayWindow.endMinute,
-                                            flow, weekView.rail),
-                          weekView.railWidth - 1, root.slotHeight, weekView.rail)
-
-                        x: weekView.dayGutter + box.x
-                        y: Math.round(root.ruleGap / 2) + index * root.slotPitch
-                        width: box.width
-                        height: root.slotHeight
-                        radius: Style.cornerRadius > 0 ? Style.cornerRadius
-                                                       : Style.space(3)
-                        color: Util.alpha(root.colorOf(modelData), 0.30)
-
-                        Text {
-                          anchors.fill: parent
-                          anchors.leftMargin: Style.spacing.sm
-                          anchors.rightMargin: Style.spacing.sm
-                          verticalAlignment: Text.AlignVCenter
-                          elide: Text.ElideRight
-                          textFormat: Text.PlainText
-                          text: Logic.singleLine(modelData.title)
-                          color: root.foreground
-                          font.family: root.fontFamily
-                          font.pixelSize: Style.font.caption
-                        }
-
-                        MouseArea {
-                          anchors.fill: parent
-                          cursorShape: Qt.PointingHandCursor
-                          onClicked: root.openEvent(modelData)
-                        }
+                      onClicked: function (mouse) {
+                        root.selectedKey = weekDay.modelData
+                        if (mouse.button === Qt.RightButton)
+                          weekColumnMenu.openFor(weekDay.modelData, mouse.x, mouse.y)
                       }
                     }
 
-                    // Then the timed ones, each as long as it lasts, stacked
-                    // where they collide.
                     Repeater {
-                      model: dayRow.blocks
+                      model: weekDay.blocks
 
                       Rectangle {
                         required property var modelData
-                        readonly property var flow: Logic.eventOverflow(
-                          modelData.event, dayRow.modelData)
-                        readonly property var box: Logic.blockSpan(
-                          Logic.spilledSpan(modelData.startMinute,
-                                            modelData.endMinute,
-                                            flow, weekView.rail),
-                          weekView.railWidth - 1, root.slotHeight, weekView.rail)
+                        readonly property var box: Logic.blockGeometry(
+                          modelData, weekView.hourHeight, root.slotHeight,
+                          root.dayWindow)
+                        readonly property var column: Logic.blockColumn(
+                          modelData, weekDay.width - 4, root.slotGap)
 
                         visible: Logic.inWindow(modelData, root.dayWindow)
-                        x: weekView.dayGutter + box.x
-                        y: Math.round(root.ruleGap / 2)
-                           + (dayRow.bucket.allDay.length + modelData.lane)
-                             * root.slotPitch
-                        width: box.width
-                        height: root.slotHeight
+                        x: 2 + column.x
+                        y: box.y
+                        width: column.width
+                        height: box.height
                         radius: Style.cornerRadius > 0 ? Style.cornerRadius
                                                        : Style.space(3)
-                        color: Util.alpha(root.colorOf(modelData.event), 0.30)
+                        color: Util.alpha(root.colorOf(modelData.event), 0.24)
 
-                        Row {
+                        Column {
                           anchors.fill: parent
-                          anchors.leftMargin: Style.spacing.xs
-                          anchors.rightMargin: Style.spacing.xs
-                          spacing: Style.spacing.xxs
+                          anchors.margins: Style.spacing.xs
+                          spacing: 0
                           clip: true
 
-                          Rectangle {
-                            anchors.verticalCenter: parent.verticalCenter
-                            width: Style.space(4)
-                            height: width
-                            radius: width / 2
-                            color: root.colorOf(modelData.event)
-                          }
-
                           Text {
-                            anchors.verticalCenter: parent.verticalCenter
-                            width: parent.width - Style.space(4)
-                                   - Style.spacing.xxs
+                            width: parent.width
                             elide: Text.ElideRight
                             textFormat: Text.PlainText
                             text: Logic.singleLine(modelData.event.title)
                             color: root.foreground
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption
+                            font.weight: Font.DemiBold
+                          }
+
+                          Text {
+                            visible: parent.height > root.captionLine * 2.4
+                            width: parent.width
+                            elide: Text.ElideRight
+                            textFormat: Text.PlainText
+                            text: Logic.formatRange(modelData.event, root.timeFormat)
+                            color: root.subdued
                             font.family: root.fontFamily
                             font.pixelSize: Style.font.caption
                           }
@@ -4892,29 +4895,33 @@ Panel {
                         }
                       }
                     }
-
-                    // Now, down today's row alone.
-                    Rectangle {
-                      visible: dayRow.isToday
-                      readonly property int nowMinute:
-                        root.today.getHours() * 60 + root.today.getMinutes()
-                      x: weekView.dayGutter
-                         + Math.round((Math.max(root.dayWindow.startMinute,
-                                       Math.min(root.dayWindow.endMinute, nowMinute))
-                                       - weekView.rail.startMinute)
-                                      * weekView.railWidth
-                                      / (weekView.rail.hours * 60))
-                      y: 0
-                      width: 2
-                      height: dayRow.height
-                      color: Color.accent
-                    }
-
-                    Rule {
-                      width: weekRows.width
-                      anchors.bottom: parent.bottom
-                    }
                   }
+                }
+
+                Rectangle {
+                  x: root.hourGutter + weekView.timetableWidth
+                  y: root.railTop
+                  width: 1
+                  height: weekView.hourHeight * root.dayWindow.hours
+                  color: root.hairline
+                  opacity: 0.25
+                }
+
+                // Current time crosses today's column only.
+                Rectangle {
+                  readonly property int todayColumn: root.weekKeys.indexOf(root.todayKey)
+                  readonly property int nowMinute:
+                    root.today.getHours() * 60 + root.today.getMinutes()
+                  visible: todayColumn >= 0
+                           && nowMinute >= root.dayWindow.startMinute
+                           && nowMinute <= root.dayWindow.endMinute
+                  x: root.hourGutter + todayColumn * weekView.dayWidth
+                  y: root.railTop
+                     + Math.round((nowMinute - root.dayWindow.startMinute)
+                                  * weekView.hourHeight / 60)
+                  width: weekView.dayWidth
+                  height: 2
+                  color: Color.accent
                 }
               }
             }

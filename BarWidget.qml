@@ -3,33 +3,37 @@ import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
+import "Logic.js" as Logic
 
-// The omarcal clock. Clicking it opens the calendar in Panel.qml.
+// The omarcal clock. Left-click opens the calendar, right-click cycles the
+// same format ring as Omarchy's clock, and middle-click opens the timezone
+// picker.
 BarWidget {
   id: root
   moduleName: "lancefaul.omarcal"
-
-  // "Saturday, September 19, 2026 • 08:15:34 PM". The bullet is quoted
-  // because Qt.formatDateTime treats unquoted characters as field codes.
-  // Other formats become a setting later; this is the default.
-  readonly property string defaultFormat: "dddd, MMMM d, yyyy '•' hh:mm:ss AP"
 
   property date now: clock.date
 
   readonly property var service: bar && bar.shell ? bar.shell.serviceFor(moduleName) : null
 
-  // The clock face is a setting like any other, so it comes from the helper's
-  // store rather than shell.json — the panel can write that one. The inline
-  // manifest defaults stand in until the first `status` answers.
+  // The helper is the source of truth for widget settings. It exposes
+  // optimistic writes immediately, which lets consecutive right-clicks walk
+  // forward even while the helper is still saving the previous click.
   function pref(name, fallback) {
-    if (service && service.settingsLoaded) return service.setting(name, fallback)
+    if (service && typeof service.setting === "function") return service.setting(name, fallback)
     return setting(name, fallback)
   }
 
-  readonly property string activeFormat: vertical
-    ? pref("verticalFormat", "HH\nmm\nss")
-    : pref("format", defaultFormat)
-  readonly property string displayText: Qt.formatDateTime(now, activeFormat)
+  readonly property string configuredFormat: String(vertical
+    ? pref("verticalFormat", Logic.settingDefault("verticalFormat"))
+    : pref("format", Logic.settingDefault("format")))
+  readonly property string configuredAltFormat: String(vertical
+    ? pref("verticalFormatAlt", Logic.settingDefault("verticalFormatAlt"))
+    : pref("formatAlt", Logic.settingDefault("formatAlt")))
+  readonly property var formatRing: Logic.clockFormatRing(
+    configuredFormat, configuredAltFormat, Logic.clockFormats(vertical))
+  readonly property string activeFormat: configuredFormat
+  readonly property string displayText: formatted(now)
   readonly property var verticalLines: displayText.split("\n")
 
   readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false
@@ -42,6 +46,18 @@ BarWidget {
   function refresh() {
     now = new Date()
     if (panelLoader.item && panelLoader.item.refresh) panelLoader.item.refresh()
+  }
+
+  function formatted(date) {
+    var key = Qt.formatDate(date, "yyyy-MM-dd")
+    return Qt.formatDateTime(date, activeFormat.replace(/ww/g, Logic.isoWeekLiteral(key)))
+  }
+
+  function cycleFormat() {
+    if (!service || typeof service.setSetting !== "function") return
+    var next = Logic.nextClockFormat(formatRing, configuredFormat)
+    if (!next || next === configuredFormat) return
+    service.setSetting(vertical ? "verticalFormat" : "format", next)
   }
 
   // Builds the panel if it is not up yet. Anything that opens it goes through
@@ -74,10 +90,10 @@ BarWidget {
   onBarChanged: injectPanel()
   onSettingsChanged: injectPanel()
 
-  // Seconds are on the face, so the clock has to tick at that precision.
+  // Match the stock clock's minute cadence; its built-in ring has no seconds.
   SystemClock {
     id: clock
-    precision: SystemClock.Seconds
+    precision: SystemClock.Minutes
     onDateChanged: root.now = date
   }
 
@@ -114,6 +130,7 @@ BarWidget {
     function open(): void { root.open() }
     function close(): void { root.close() }
     function toggle(): void { root.togglePanel() }
+    function cycleFormat(): void { root.cycleFormat() }
 
   }
 
@@ -129,7 +146,8 @@ BarWidget {
     verticalPadding: 8.75
 
     onPressed: function (which) {
-      if (which === Qt.MiddleButton) { if (root.bar) root.bar.run("omarchy-menu-timezone") }
+      if (which === Qt.RightButton) root.cycleFormat()
+      else if (which === Qt.MiddleButton) { if (root.bar) root.bar.run("omarchy-menu-timezone") }
       else root.togglePanel()
     }
 

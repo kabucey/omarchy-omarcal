@@ -79,10 +79,13 @@ QtObject {
     Qt.resolvedUrl("helper/omarcal-helper").toString().replace(/^file:\/\//, ""))
 
   signal eventsLoaded()
-  signal accountAdded()
+  signal accountAdded(int requestId)
 
   property bool addingAccount: false
   property string addError: ""
+  property int addErrorRequestId: -1
+  property string removeError: ""
+  property bool disconnectingAccount: false
   // Only held while the panel is showing it, and dropped the moment it stops.
   property string revealedPassword: ""
 
@@ -139,6 +142,8 @@ QtObject {
   // Everything an account brought, and its password with it.
   function removeAccount(user) {
     if (removeProc.running) return
+    disconnectingAccount = true
+    removeError = ""
     removeProc.command = [helper, "remove-account", "--user", user]
     removeProc.running = true
   }
@@ -146,6 +151,7 @@ QtObject {
   // Stops syncing one calendar and lets go of what was cached for it.
   function forgetCalendar(url) {
     if (removeProc.running) return
+    disconnectingAccount = false
     removeProc.command = [helper, "forget-calendar", "--calendar", url]
     removeProc.running = true
   }
@@ -157,10 +163,21 @@ QtObject {
     stdout: StdioCollector { id: removeOut; waitForEnd: true }
     onExited: {
       var payload = root.parse(removeOut.text, "the removal did not report back")
-      if (payload && !payload.ok) root.error = payload.error || "could not remove it"
+      if (root.disconnectingAccount) {
+        if (!payload) root.removeError = root.error || "the removal did not report back"
+        else if (!payload.ok) root.removeError = payload.error || "could not remove it"
+        else {
+          root.removeError = ""
+          root.removed()
+        }
+      } else if (payload && !payload.ok) {
+        // Forgetting a calendar shares this process, but still reports its
+        // failure through the service's general error channel.
+        root.error = payload.error || "could not remove it"
+      }
+      root.disconnectingAccount = false
       root.refreshStatus()
       root.reload()
-      root.removed()
     }
   }
 
@@ -324,9 +341,9 @@ QtObject {
 
   // ------------------------------------------------------------ one event
   //
-  // The viewer asks for a single event by uid. A recurring one needs the
-  // occurrence's `rid` too, or the helper answers with the master and the
-  // viewer shows the wrong day.
+  // The viewer asks for the event by its calendar object URL. UIDs can be
+  // reused by separate calendars; a recurring one also needs the occurrence
+  // `rid`, or the helper answers with the master and shows the wrong day.
 
   property var eventDetail: null
   property bool eventLoading: false
@@ -334,7 +351,7 @@ QtObject {
 
   // `at` is the open occurrence's start, so the helper can say what its
   // times read in the event's own zones for that occurrence, not the first.
-  function loadEvent(uid, rid, at) {
+  function loadEvent(uid, rid, at, href) {
     if (!uid) return
     // The last answer goes immediately: a viewer that opens showing the
     // previous event while this one loads is worse than one that opens empty.
@@ -343,6 +360,7 @@ QtObject {
     eventLoading = true
     detailProc.running = false
     var command = [helper, "event", "--uid", uid]
+    if (href) command = command.concat(["--href", href])
     if (rid) command = command.concat(["--rid", rid])
     if (at) command = command.concat(["--at", at])
     detailProc.command = command
@@ -371,8 +389,18 @@ QtObject {
     }
   }
 
+  property bool statusRefreshQueued: false
+  property int settingsRevision: 0
+
   function refreshStatus() {
-    if (statusProc.running) return
+    if (statusProc.running) {
+      statusRefreshQueued = true
+      return
+    }
+    statusRefreshQueued = false
+    statusProc.settingsRevision = settingsRevision
+    statusProc.startedWithPendingSettings =
+      settingsQueue.length > 0 || settingProc.running
     statusProc.command = [helper, "status"]
     statusProc.running = true
   }
@@ -401,10 +429,12 @@ QtObject {
   // Add an account: discover its calendars and store the password. The
   // password goes over stdin, never argv — argv is readable from /proc by
   // anything running as this user, which is how the network panel does it too.
-  function addAccount(user, server, password) {
+  function addAccount(user, server, password, requestId) {
     if (loginProc.running) return
     addError = ""
+    addErrorRequestId = requestId
     addingAccount = true
+    loginProc.requestId = requestId
     loginProc.secret = password
     loginProc.command = [helper, "login", "--user", user, "--server", server]
     loginProc.running = true
@@ -416,18 +446,23 @@ QtObject {
     interval: 60 * 1000
     onTriggered: {
       if (!loginProc.running) return
+      loginProc.timedOut = true
       loginProc.running = false
       root.addingAccount = false
+      root.addErrorRequestId = loginProc.requestId
       root.addError = "the server did not answer in time"
     }
   }
 
   property Process loginProc: Process {
     property string secret: ""
+    property int requestId: -1
+    property bool timedOut: false
     running: false
     stdinEnabled: true
     stdout: StdioCollector { id: loginOut; waitForEnd: true }
     onStarted: {
+      timedOut = false
       write(secret + "\n")
       secret = ""
       root.loginTimeout.restart()
@@ -435,17 +470,27 @@ QtObject {
     onExited: {
       root.loginTimeout.stop()
       root.addingAccount = false
+      if (timedOut) {
+        timedOut = false
+        return
+      }
       var payload = root.parse(loginOut.text, "the helper did not report back")
-      if (!payload) { root.addError = root.error; return }
+      if (!payload) {
+        root.addErrorRequestId = requestId
+        root.addError = root.error
+        return
+      }
       if (!payload.ok) {
+        root.addErrorRequestId = requestId
         root.addError = payload.error || "could not add the account"
         return
       }
+      root.addErrorRequestId = -1
       root.addError = ""
       root.revealedPassword = ""
       root.refreshStatus()
       root.sync()
-      root.accountAdded()
+      root.accountAdded(requestId)
     }
   }
 
@@ -551,22 +596,34 @@ QtObject {
   }
 
   property Process statusProc: Process {
+    property int settingsRevision: 0
+    property bool startedWithPendingSettings: false
     running: false
     stdout: StdioCollector { id: statusOut; waitForEnd: true }
     onExited: {
       var payload = root.parse(statusOut.text, "")
-      if (!payload || !payload.ok) return
-      root.calendars = payload.calendars || []
-      root.accounts = payload.accounts || []
-      root.account = payload.account ? payload.account.user : ""
-      root.localZone = payload.localZone || ""
-      root.pendingCount = payload.pending || 0
-      root.pendingProblems = payload.pendingProblems || []
-      root.server = payload.account ? payload.account.server : ""
-      root.settings = payload.settings || ({})
-      root.cacheBytes = payload.cacheBytes || 0
-      root.objectCount = payload.objects || 0
-      root.settingsLoaded = true
+      if (payload && payload.ok) {
+        root.calendars = payload.calendars || []
+        root.accounts = payload.accounts || []
+        root.account = payload.account ? payload.account.user : ""
+        root.localZone = payload.localZone || ""
+        root.pendingCount = payload.pending || 0
+        root.pendingProblems = payload.pendingProblems || []
+        root.server = payload.account ? payload.account.server : ""
+        root.settings = Logic.mergePendingSettings(
+          payload.settings || ({}), root.settings,
+          Logic.statusSettingsNeedOverlay(
+            settingsRevision, root.settingsRevision,
+            startedWithPendingSettings,
+            root.settingsQueue.length > 0 || root.settingProc.running))
+        root.cacheBytes = payload.cacheBytes || 0
+        root.objectCount = payload.objects || 0
+        root.settingsLoaded = true
+      }
+      if (root.statusRefreshQueued) {
+        root.statusRefreshQueued = false
+        root.refreshStatus()
+      }
     }
   }
 
@@ -590,6 +647,7 @@ QtObject {
     for (var key in settings) next[key] = settings[key]
     next[name] = value
     settings = next
+    settingsRevision += 1
     settingsQueue.push(name + "=" + JSON.stringify(value))
     runNextSetting()
   }

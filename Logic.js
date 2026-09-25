@@ -136,6 +136,12 @@ function isoWeekNumber(key) {
   return 1 + Math.round((date - firstThursday) / (7 * 86400000))
 }
 
+// Qt has no ISO week field, so the bar clock replaces its `ww` token before
+// handing the rest of the format to Qt. `key` is the local YYYY-MM-DD date.
+function isoWeekLiteral(key) {
+  return pad(isoWeekNumber(key), 2)
+}
+
 // ------------------------------------------------------------------ bucketing
 
 // Every local date an event touches, inclusive of both ends.
@@ -547,6 +553,26 @@ function accountProblem(user, server, password, passwordHeld) {
   return ""
 }
 
+// A result from a dismissed account form must not change a form opened later.
+// Request ids are local to the open panel; -1 means there is no live attempt.
+function accountRequestMatches(activeRequestId, resultRequestId) {
+  var active = Number(activeRequestId), result = Number(resultRequestId)
+  return isFinite(active) && active >= 0 && active === result
+}
+
+// Select the one account-form message that is relevant to the current state.
+// In particular, field validation is suppressed after submission, so clearing
+// the password on success cannot briefly turn into a "password needed" error.
+function accountSetupMessage(state) {
+  if (!state || !state.open) return ""
+  if (state.removeError) return String(state.removeError)
+  if (state.addError && accountRequestMatches(
+        state.activeRequestId, state.addErrorRequestId))
+    return String(state.addError)
+  if (Number(state.activeRequestId) >= 0) return ""
+  return state.hasInput ? String(state.problem || "") : ""
+}
+
 function providerName(server) {
   var text = String(server || "").trim()
   if (!text) return "Calendars"
@@ -716,27 +742,90 @@ function refreshLabel(minutes) {
   return value + " min"
 }
 
-// The bar clock's face, as choices rather than a format string. The default
-// is first and is the one the widget ships with.
-//
-// Named rather than shown as examples: the sidebar is too narrow for
-// "Saturday, September 19, 2026 • 08:15:34 PM" and a dropdown row that
-// elides its own preview is worse than no preview. The panel renders the
-// chosen format underneath instead, where it can wrap.
-var CLOCK_PRESETS = [
-  { label: "Full date and time", format: "dddd, MMMM d, yyyy '•' hh:mm:ss AP" },
-  { label: "Short date and time", format: "ddd, MMM d '•' hh:mm AP" },
-  { label: "Short date, 24-hour", format: "MMM d '•' HH:mm" },
-  { label: "Time only", format: "hh:mm:ss AP" },
-  { label: "Time only, 24-hour", format: "HH:mm" }
+// These are the same fixed rings as Omarchy's clock plugin. Their order is
+// user-visible: right-click advances one entry, and custom/alternate formats
+// are appended after the built-in choices without moving them around.
+var CLOCK_FORMATS = [
+  "dddd HH:mm",
+  "dddd h:mm AP",
+  "HH:mm",
+  "h:mm AP",
+  "ddd d MMM HH:mm",
+  "ddd d MMM h:mm AP",
+  "d MMMM 'W'ww yyyy",
+  "yyyy-MM-dd HH:mm"
 ]
 
-function clockPresets() { return CLOCK_PRESETS }
+var VERTICAL_CLOCK_FORMATS = [
+  "HH\n—\nmm",
+  "h\n—\nmm\nAP",
+  "dd\nMMM\n'W'ww\n''yy",
+  "HH\nmm"
+]
+
+var CLOCK_PRESET_LABELS = [
+  "Weekday, 24-hour",
+  "Weekday, 12-hour",
+  "Time only, 24-hour",
+  "Time only, 12-hour",
+  "Short date, 24-hour",
+  "Short date, 12-hour",
+  "ISO week date",
+  "ISO date and time"
+]
+
+function clockFormats(vertical) {
+  return vertical ? VERTICAL_CLOCK_FORMATS.slice() : CLOCK_FORMATS.slice()
+}
+
+function clockFormatRing(configured, configuredAlt, presets) {
+  var ring = []
+  var candidates = (presets || []).concat([configuredAlt, configured])
+  for (var i = 0; i < candidates.length; i++) {
+    var format = String(candidates[i] === undefined || candidates[i] === null ? "" : candidates[i])
+    if (format === "" || ring.indexOf(format) !== -1) continue
+    ring.push(format)
+  }
+  return ring.length > 0 ? ring : ["HH:mm"]
+}
+
+function nextClockFormat(ring, current) {
+  if (!ring || ring.length === 0) return ""
+  var index = ring.indexOf(String(current === undefined || current === null ? "" : current))
+  return ring[(index + 1) % ring.length]
+}
+
+// A `status` response can overlap an optimistic setting write. Start with its
+// full stored snapshot, then keep the locally chosen values until their
+// queued writes have been acknowledged.
+function mergePendingSettings(stored, optimistic, hasPendingWrites) {
+  var merged = {}
+  for (var key in stored) merged[key] = stored[key]
+  if (hasPendingWrites)
+    for (var pendingKey in optimistic) merged[pendingKey] = optimistic[pendingKey]
+  return merged
+}
+
+// A status process can capture settings before a concurrent helper write is
+// committed, then finish after the write has left the queue. Remember both
+// ends of that overlap; checking only the queue at response time is too late.
+function statusSettingsNeedOverlay(startRevision, currentRevision,
+                                   startedWithPendingWrites, hasPendingWrites) {
+  return !!startedWithPendingWrites || !!hasPendingWrites
+    || Number(startRevision) !== Number(currentRevision)
+}
+
+function clockPresets() {
+  var presets = []
+  for (var i = 0; i < CLOCK_FORMATS.length; i++)
+    presets.push({ label: CLOCK_PRESET_LABELS[i], format: CLOCK_FORMATS[i] })
+  return presets
+}
 
 // Which preset a stored format is, or -1 when it is one the person typed.
 function clockPresetIndex(format) {
-  for (var i = 0; i < CLOCK_PRESETS.length; i++)
-    if (CLOCK_PRESETS[i].format === format) return i
+  for (var i = 0; i < CLOCK_FORMATS.length; i++)
+    if (CLOCK_FORMATS[i] === format) return i
   return -1
 }
 
@@ -776,8 +865,10 @@ var SETTING_DEFAULTS = {
   timeFormat: "12h",
   showWeekNumbers: false,
   refreshMinutes: 15,
-  format: CLOCK_PRESETS[0].format,
-  verticalFormat: "HH\nmm\nss",
+  format: CLOCK_FORMATS[0],
+  formatAlt: "d MMMM 'W'ww yyyy",
+  verticalFormat: VERTICAL_CLOCK_FORMATS[0],
+  verticalFormatAlt: "dd\nMMM\n'W'ww\n''yy",
   wrapEvents: false,
   dayStartHour: 0,
   dayEndHour: 24
@@ -949,6 +1040,7 @@ function isWebLink(url) {
 function mergeOccurrence(seed, detail) {
   if (!seed) return detail || null
   if (!detail || detail.uid !== seed.uid) return seed
+  if (seed.href && detail.href && detail.href !== seed.href) return seed
   var out = {}
   for (var key in detail) out[key] = detail[key]
   out.start = seed.start
@@ -1059,6 +1151,15 @@ function weekHeading(days) {
     : MONTH_NAMES[a.m - 1] + " " + a.d + " – "
       + MONTH_NAMES[b.m - 1] + " " + b.d
   return { title: title, meta: a.y === b.y ? String(a.y) : a.y + " – " + b.y }
+}
+
+// Compact column heading for the conventional week timetable. The weekday
+// and date are one label ("Sun 20"), so a narrow column still says which day
+// it owns without a second header row.
+function weekDayHeader(key) {
+  if (!isDateKey(key)) return ""
+  var date = parseKey(key)
+  return DAY_NAMES[weekdayOf(key)].slice(0, 3) + " " + date.d
 }
 
 // --------------------------------------------------- week view, flipped
@@ -1258,8 +1359,8 @@ function searchLimit() { return SEARCH_LIMIT }
 
 var PLUGIN_ID = "lancefaul.omarcal"
 var RELEASES_API =
-  "https://api.github.com/repos/lancefaul/omarchy-omarcal/releases/latest"
-var RELEASES_PAGE = "https://github.com/lancefaul/omarchy-omarcal/releases/"
+  "https://api.github.com/repos/kabucey/omarchy-omarcal/releases/latest"
+var RELEASES_PAGE = "https://github.com/kabucey/omarchy-omarcal/releases/"
 var UPDATE_COMMAND = ["omarchy", "plugin", "update", PLUGIN_ID, "--yes"]
 var RESTART_COMMAND = ["omarchy", "restart", "shell"]
 var UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000

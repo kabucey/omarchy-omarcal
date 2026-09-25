@@ -242,7 +242,9 @@ class Series(unittest.TestCase):
             "title": "Class (new room)", "start": "2026-09-22T09:00:00", "end": "2026-09-22T10:00:00"})
         ops = helper.plan_save(SERIES, req, ZONES)
         self.assertEqual([o["method"] for o in ops], ["PUT", "PUT"])
-        old, new = unfold(ops[0]["body"]), unfold(ops[1]["body"])
+        new, old = unfold(ops[0]["body"]), unfold(ops[1]["body"])
+        self.assertNotEqual(ops[0]["url"], HREF)
+        self.assertEqual(ops[1]["url"], HREF)
         # 09:00 CDT on Sept 22 is 14:00Z; the old series ends one second before.
         self.assertIn("UNTIL=20260922T135959Z", old)
         self.assertNotIn("COUNT", old.split("BEGIN:VEVENT")[1].split("END:VEVENT")[0])
@@ -250,8 +252,8 @@ class Series(unittest.TestCase):
         self.assertIn("DTSTART;TZID=America/Chicago:20260922T090000", new)
         # Three of ten happened before (Sept 1, 8, 15): seven left.
         self.assertIn("COUNT=7", new)
-        self.assertTrue(ops[1]["ifNoneMatch"])
-        self.assertTrue(ops[1]["primary"])
+        self.assertTrue(ops[0]["ifNoneMatch"])
+        self.assertTrue(ops[0]["primary"])
         self.assertIn("EXDATE;TZID=America/Chicago:20261006T090000", new, "later exclusions go along")
 
     def test_following_from_the_first_is_all(self):
@@ -273,6 +275,76 @@ class Series(unittest.TestCase):
         self.assertIn("DTSTART;TZID=America/Chicago:20260915T120000", body)
 
 
+class SeriesSplitSafety(unittest.TestCase):
+    def plan(self):
+        req = request(scope="following", occurrenceStart="2026-09-22T09:00:00-05:00",
+                      changes=["title"], event={
+                          "title": "Class (new room)", "start": "2026-09-22T09:00:00",
+                          "end": "2026-09-22T10:00:00"})
+        return helper.plan_save(SERIES, req, ZONES)
+
+    def test_failed_replacement_create_leaves_the_original_series_unchanged(self):
+        ops = self.plan()
+        original = "the untruncated original"
+        server = {HREF: original}
+        sent = []
+        saved = helper.send
+
+        def send(_session, method, url, _body, _headers):
+            sent.append((method, url))
+            if method == "PUT" and url == HREF:
+                server[HREF] = "truncated original"
+                return 204, {"etag": '"short"'}, b""
+            if method == "PUT":
+                return 500, {}, b"create failed"
+            return 500, {}, b"unexpected request"
+
+        helper.send = send
+        try:
+            with self.assertRaises(helper.Failure):
+                helper.run_writes(lambda _url: object(), ops)
+        finally:
+            helper.send = saved
+
+        self.assertEqual(server[HREF], original)
+        self.assertEqual(sent, [("PUT", ops[0]["url"])],
+                         "the replacement is attempted before the destructive truncation")
+
+    def test_original_conflict_removes_the_new_series_conditionally(self):
+        ops = self.plan()
+        replacement = ops[0]["url"]
+        server = {HREF: "the unchanged original"}
+        sent = []
+        saved = helper.send
+
+        def send(_session, method, url, _body, headers):
+            sent.append((method, url, headers.copy()))
+            if method == "PUT" and url == replacement:
+                server[replacement] = "new series"
+                return 201, {"etag": '"new"'}, b""
+            if method == "PUT" and url == HREF:
+                return 412, {}, b"changed elsewhere"
+            if method == "DELETE" and url == replacement:
+                if headers.get("If-Match") != '"new"':
+                    return 412, {}, b"replacement changed"
+                server.pop(replacement, None)
+                return 204, {}, b""
+            return 500, {}, b"unexpected request"
+
+        helper.send = send
+        try:
+            with self.assertRaises(helper.Failure) as caught:
+                helper.run_writes(lambda _url: object(), ops)
+        finally:
+            helper.send = saved
+
+        self.assertEqual(caught.exception.code, "conflict")
+        self.assertIn("new series was removed", caught.exception.message)
+        self.assertEqual(server, {HREF: "the unchanged original"})
+        self.assertEqual([method for method, _url, _headers in sent], ["PUT", "PUT", "DELETE"])
+        self.assertEqual(sent[-1][2].get("If-Match"), '"new"')
+
+
 class ReviewFindings(unittest.TestCase):
     """The review of the write path, 2026-09-21: each finding, as it was
     reproduced, and what it should have done."""
@@ -284,7 +356,7 @@ class ReviewFindings(unittest.TestCase):
                       occurrenceStart="2026-09-15T11:00:00-05:00", changes=["title"],
                       event={"title": "Class (new)", "start": "2026-09-15T11:00:00",
                              "end": "2026-09-15T12:00:00"})
-        new = unfold(helper.plan_save(SERIES, req, ZONES)[1]["body"])
+        new = unfold(helper.plan_save(SERIES, req, ZONES)[0]["body"])
         comps = events_of(new)
         master = [c for c in comps if "RRULE" in c][0]
         self.assertIn("DTSTART;TZID=America/Chicago:20260915T090000", master)

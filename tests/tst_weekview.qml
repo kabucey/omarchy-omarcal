@@ -36,4 +36,14 @@ TestCase {
     compare(Logic.weekHeading([]).title, "")
     compare(Logic.weekHeading(null).meta, "")
   }
+
+  // The visible column contract: days run left to right and each column owns
+  // a weekday/date label rather than the former row label.
+  function test_day_column_headers() {
+    var days = Logic.weekDays("2026-09-20", 0)
+    compare(days.map(Logic.weekDayHeader),
+            ["Sun 20", "Mon 21", "Tue 22", "Wed 23",
+             "Thu 24", "Fri 25", "Sat 26"])
+    compare(Logic.weekDayHeader("not-a-date"), "")
+  }
 }

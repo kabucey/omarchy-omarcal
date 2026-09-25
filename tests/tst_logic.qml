@@ -609,6 +609,29 @@ TestCase {
     compare(Logic.accountProblem("me@example.com", "https://caldav.icloud.com/", "pw"), "")
   }
 
+  // Submitted state owns the feedback until its result arrives. A completed
+  // request from a dismissed form cannot surface on the form opened afterward.
+  function test_account_feedback_is_scoped_to_the_open_submission() {
+    compare(Logic.accountSetupMessage({
+      open: true, hasInput: true, problem: "A password is needed.",
+      activeRequestId: 8
+    }), "")
+    compare(Logic.accountSetupMessage({
+      open: true, hasInput: true, problem: "A password is needed.",
+      addError: "the server refused the account", addErrorRequestId: 8,
+      activeRequestId: 8
+    }), "the server refused the account")
+    compare(Logic.accountSetupMessage({
+      open: true, hasInput: true, problem: "A password is needed.",
+      addError: "old connection failed", addErrorRequestId: 7,
+      activeRequestId: 8
+    }), "")
+    compare(Logic.accountSetupMessage({
+      open: false, hasInput: true, problem: "A password is needed.",
+      activeRequestId: -1
+    }), "")
+  }
+
   // ------------------------------------------------------------- provider
 
   function test_provider_names_the_known_services() {

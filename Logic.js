@@ -1229,7 +1229,9 @@ function openingHour(blocks, fallbackHour) {
 }
 
 // Where one block sits on a rail `hourHeight` tall per hour, and how tall it
-// is. A very short event still gets a box big enough to read.
+// is. The painted height always represents the event's real duration: making
+// a short appointment easier to read must not make 9:45–10:00 look as though
+// it runs past 10. `minimumHeight` only protects a degenerate zero-pixel box.
 function blockGeometry(block, hourHeight, minimumHeight, win) {
   var w = win || WHOLE_DAY
   var from = Math.max(w.startMinute, Math.min(w.endMinute, block.startMinute))
@@ -1237,7 +1239,8 @@ function blockGeometry(block, hourHeight, minimumHeight, win) {
   var top = (from - w.startMinute) * hourHeight / 60
   var height = (to - from) * hourHeight / 60
   var floor = minimumHeight === undefined ? 0 : minimumHeight
-  return { y: Math.round(top), height: Math.round(Math.max(height, floor)) }
+  var painted = height > 0 ? height : floor
+  return { y: Math.round(top), height: Math.max(1, Math.round(painted)) }
 }
 
 // The horizontal share of one block. Overlapping appointments cascade instead

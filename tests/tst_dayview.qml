@@ -55,12 +55,14 @@ TestCase {
     compare(box.height, 90)
   }
 
-  // A zero-length event is already widened to fifteen minutes by layoutTimed;
-  // the floor is for a rail drawn small enough that fifteen is still nothing.
-  function test_block_geometry_has_a_floor() {
-    var blocks = Logic.layoutTimed([timed("A", "13:00", "13:05")], "2026-09-20")
-    var box = Logic.blockGeometry(blocks[0], 30, 18)
-    verify(box.height >= 18)
+  // Regression: Scrum of scrums is 9:45–10:00. The former readable-height
+  // floor painted it past 10:00, making the timeline tell the wrong duration.
+  function test_short_block_keeps_its_true_duration() {
+    var blocks = Logic.layoutTimed([timed("Scrum of scrums", "09:45", "10:00")],
+                                   "2026-09-20")
+    var box = Logic.blockGeometry(blocks[0], 60, 30)
+    compare(box.y, 9 * 60 + 45)
+    compare(box.height, 15)
   }
 
   function test_block_geometry_clamps_to_the_day() {

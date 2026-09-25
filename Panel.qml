@@ -4712,8 +4712,9 @@ Panel {
 
                     Column {
                       anchors.fill: parent
-                      anchors.topMargin: Style.spacing.xs
-                      anchors.bottomMargin: Style.spacing.xs
+                      anchors.topMargin: parent.height <= root.captionLine * 1.6
+                        ? 0 : Style.spacing.xs
+                      anchors.bottomMargin: anchors.topMargin
                       anchors.leftMargin: Style.spacing.xs + Style.space(5)
                       anchors.rightMargin: Style.spacing.xs
                       spacing: 0
@@ -4724,7 +4725,9 @@ Panel {
 
                       Text {
                         width: parent.width
-                        wrapMode: Text.Wrap
+                        height: parent.showRange ? implicitHeight : parent.height
+                        verticalAlignment: Text.AlignVCenter
+                        wrapMode: parent.showRange ? Text.Wrap : Text.NoWrap
                         elide: Text.ElideRight
                         maximumLineCount: Math.max(
                           1, Math.floor(parent.height / root.captionLine)
@@ -5090,8 +5093,9 @@ Panel {
 
                         Column {
                           anchors.fill: parent
-                          anchors.topMargin: Style.spacing.xs
-                          anchors.bottomMargin: Style.spacing.xs
+                          anchors.topMargin: parent.height <= root.captionLine * 1.6
+                            ? 0 : Style.spacing.xs
+                          anchors.bottomMargin: anchors.topMargin
                           anchors.leftMargin: Style.spacing.xs + Style.space(5)
                           anchors.rightMargin: Style.spacing.xs
                           spacing: 0
@@ -5102,7 +5106,9 @@ Panel {
 
                           Text {
                             width: parent.width
-                            wrapMode: Text.Wrap
+                            height: parent.showRange ? implicitHeight : parent.height
+                            verticalAlignment: Text.AlignVCenter
+                            wrapMode: parent.showRange ? Text.Wrap : Text.NoWrap
                             elide: Text.ElideRight
                             maximumLineCount: Math.max(
                               1, Math.floor(parent.height / root.captionLine)

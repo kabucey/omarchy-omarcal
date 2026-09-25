@@ -83,8 +83,10 @@ class Offline(unittest.TestCase):
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(objects)")}
         if "pending" not in cols:
             self.conn.execute("ALTER TABLE objects ADD COLUMN pending INTEGER NOT NULL DEFAULT 0")
-        self.conn.execute("INSERT INTO accounts(user, server) VALUES('me@example.com', ?)",
-                          (helper.ICLOUD,))
+        self.conn.execute(
+            "INSERT INTO accounts(id,user,identity,provider,server) VALUES(?,?,?,?,?)",
+            ("me@example.com", "me@example.com", "me@example.com", "icloud", helper.ICLOUD),
+        )
         self.conn.execute("INSERT INTO calendars(url, name, enabled, account) VALUES(?, 'Cal', 1, "
                           "'me@example.com')", (CAL,))
         self.server = Server()
@@ -167,7 +169,7 @@ class Offline(unittest.TestCase):
         self.assertEqual(self.rows()[0][2], original)
         problems = helper.pending_status(self.conn)["pendingProblems"]
         self.assertEqual([p["title"] for p in problems], ["Mine", "Later"])
-        self.assertIn("changed on iCloud", problems[0]["error"])
+        self.assertIn("changed on the calendar server", problems[0]["error"])
 
     def test_still_offline_stays_queued(self):
         self.server.online = False

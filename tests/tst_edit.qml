@@ -291,6 +291,30 @@ TestCase {
     compare(Logic.editableCalendars(cals, "b").map(function (c) { return c.value }), ["a", "b", "d"])
   }
 
+  // Some providers allow changes to an existing event while refusing new
+  // resources without a conditional-create guarantee. New-event targets must
+  // honor that capability; the current event remains editable.
+  function test_create_disabled_calendar_is_excluded_only_from_creates() {
+    var cals = [
+      { url: "google", name: "Google", account: "google:sub",
+        capabilities: { create: false } },
+      { url: "icloud", name: "iCloud", account: "icloud:user" }
+    ]
+    compare(Logic.creatableCalendars(cals, "").map(function (c) { return c.value }),
+            ["icloud"])
+    compare(Logic.defaultCalendar(cals, "google", "google:sub"), "icloud")
+    compare(Logic.editableCalendars(cals, "google").map(function (c) { return c.value }),
+            ["google", "icloud"])
+    compare(Logic.editableCalendars(cals, "icloud").map(function (c) { return c.value }),
+            ["icloud"], "a calendar that requires create is not offered as a move target")
+    compare(Logic.scopeChoicesForCalendar({ recurring: true }, ["title"], cals[0])
+      .map(function (choice) { return choice.value }), ["this", "all"])
+    compare(Logic.scopeChoicesForCalendar({ recurring: true }, ["rrule"], cals[0])
+      .map(function (choice) { return choice.value }), ["all"])
+    verify(Logic.actionPrompt("save", [{ value: "all", label: "All events" }], ["rrule"])
+      .indexOf("every occurrence") !== -1)
+  }
+
   // ------------------------------------------------------------- prompts
 
   function test_prompts_follow_the_scopes() {
@@ -743,6 +767,20 @@ TestCase {
     compare(rows.map(function (r) { return r.note }), ["me@icloud.com", "me@icloud.com", "me@work.com"])
     rows = Logic.editableCalendars(severalAccounts().slice(0, 2), "")
     compare(rows.map(function (r) { return r.note }), ["", ""])
+  }
+
+  function test_calendar_option_labels_do_not_expose_provider_account_ids() {
+    var rows = [
+      { url: "google", name: "Primary", account: "google:opaque-sub",
+        accountLabel: "Google · me@example.com", capabilities: { create: false } },
+      { url: "icloud", name: "Personal", account: "icloud:me@example.com",
+        accountLabel: "iCloud · me@example.com" }
+    ]
+    var choices = Logic.editableCalendars(rows, "google")
+    compare(choices.map(function (row) { return row.note }),
+            ["Google · me@example.com", "iCloud · me@example.com"])
+    verify(Logic.moveNote(rows, "icloud", "google").indexOf("google:opaque-sub") === -1)
+    verify(Logic.moveNote(rows, "icloud", "google").indexOf("Google · me@example.com") !== -1)
   }
 
   function test_a_vanished_default_is_said() {

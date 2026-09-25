@@ -86,8 +86,32 @@ TestCase {
     var first = Logic.blockColumn(blocks[0], 300, 4)
     var second = Logic.blockColumn(blocks[1], 300, 4)
     compare(first.x, 0)
-    compare(second.x, 150)
-    compare(first.width, 146)
+    compare(first.width, 296)
+    compare(second.x, 124)
+    compare(second.width, 172)
+  }
+
+  // Regression: a crowded afternoon used to divide the rail into six tiny
+  // strips. Cascading keeps every card wide enough to carry useful text while
+  // the exposed shoulders still reveal that several appointments are present.
+  function test_busy_cluster_cascades_without_unreadable_slivers() {
+    var blocks = Logic.layoutTimed([
+      timed("A", "13:00", "18:00"),
+      timed("B", "13:05", "18:00"),
+      timed("C", "13:10", "18:00"),
+      timed("D", "13:15", "18:00"),
+      timed("E", "13:20", "18:00"),
+      timed("F", "13:25", "18:00")
+    ], "2026-09-20")
+
+    var previousX = -1
+    for (var i = 0; i < blocks.length; i++) {
+      var col = Logic.blockColumn(blocks[i], 240, 2, 112)
+      verify(col.x > previousX)
+      verify(col.width >= 112)
+      compare(col.x + col.width, 238)
+      previousX = col.x
+    }
   }
 
   function test_hour_offset() {

@@ -4,13 +4,15 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 export QT_QPA_PLATFORM=offscreen QML_XHR_ALLOW_FILE_READ=1
-runner=$(command -v qmltestrunner || true)
-if [ -z "$runner" ]; then
-  for candidate in /usr/lib/qt6/bin/qmltestrunner /usr/lib/qt5/bin/qmltestrunner; do
-    if [ -x "$candidate" ]; then runner=$candidate; break; fi
-  done
-fi
-[ -n "$runner" ] || { echo "qmltestrunner not found on PATH or in the Qt system directories"; exit 127; }
+# The desktop session may export a platform theme plugin intended for normal
+# GUI applications. Headless qmltestrunner must not load it: a plugin crash
+# here takes down the runner before any test can report a useful failure.
+unset QT_QPA_PLATFORMTHEME
+
+# This suite imports Qt 6 modules. Arch can have both runners installed and
+# /usr/bin/qmltestrunner may resolve to Qt 5, so prefer Qt 6 explicitly.
+runner=/usr/lib/qt6/bin/qmltestrunner
+[ -x "$runner" ] || { echo "Qt 6 qmltestrunner not found at $runner"; exit 127; }
 
 status=0
 for suite in tests/tst_*.qml; do

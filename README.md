@@ -9,9 +9,8 @@ degrades to an error on that calendar alone instead of hanging the widget.
 Parsing, recurrence expansion and VTIMEZONE handling come from `libical`,
 which is already on the system.
 
-**iCloud is the only provider tested so far.** The account form is built
-around an Apple ID and an app-specific password; `PROVIDER_PRESETS` is a list
-so another provider is one entry plus a chip, and more are coming.
+It supports iCloud with an app-specific password and Google Calendar through
+OAuth in the system browser. Provider credentials stay in the desktop keyring.
 
 ## What it does
 
@@ -70,11 +69,56 @@ readable from `/proc` by anything running as your user. Revoking the
 app-specific password from Apple's account page removes this plugin's access
 and nothing else's.
 
+## Connecting to Google Calendar
+
+Omarcal uses Google's installed-app OAuth flow. Create a Desktop OAuth client
+in your own Google Cloud project; credentials are not bundled with Omarcal.
+
+1. In the [Google Cloud console](https://console.cloud.google.com/), create or
+   select a project. Enable both the
+   [Google Calendar API](https://console.cloud.google.com/apis/library/calendar-json.googleapis.com)
+   and the [CalDAV API](https://console.cloud.google.com/apis/library/caldav.googleapis.com)
+   in that same project. Omarcal uses the Calendar API to discover calendars
+   and CalDAV to sync their events.
+2. Open **Google Auth Platform → Branding**. Set an app name, user support
+   email, and contact email. Under **Audience**, choose **Internal** if this is
+   only for your Google Workspace organization, or **External** for a personal
+   Google account. If External is in **Testing**, add your Google account under
+   **Test users**. For an External app, open **Data Access** and add the
+   Calendar scope `https://www.googleapis.com/auth/calendar`.
+3. Open **Google Auth Platform → Clients → Create client**, choose **Desktop
+   app**, create it, and download the JSON file. This is the installed-app
+   client type used by Omarcal's loopback sign-in.
+4. In Omarcal, choose **Add calendar → Google → Import credentials**, select
+   the downloaded JSON file, then choose **Continue with Google**. Sign in and
+   grant access in your browser.
+
+Google's [Calendar quickstart](https://developers.google.com/workspace/calendar/api/quickstart/python),
+[OAuth consent setup guide](https://developers.google.com/workspace/guides/configure-oauth-consent),
+[OAuth client setup guide](https://developers.google.com/workspace/guides/create-credentials),
+and [installed-app OAuth guide](https://developers.google.com/identity/protocols/oauth2/native-app)
+show the corresponding Cloud Console and desktop flow steps. Omarcal requests
+the `openid` and `email` identity scopes along with the Calendar scope. While
+an External app remains in **Testing**, Google may expire its refresh tokens
+after seven days because this app requests Calendar access; see Google's
+[OAuth token expiration rules](https://developers.google.com/identity/protocols/oauth2#refresh-token-expiration).
+
+Sign-in opens in your normal browser and returns through a short-lived
+`127.0.0.1` callback protected by PKCE and a random state value. Omarcal stores
+only the refresh token in the keyring; access tokens stay in memory.
+
+Google calendars can sync, and existing events can be edited or deleted with
+`If-Match` conflict protection. Creating Google events, managed attachments,
+and “this and following” series splits are intentionally unavailable for now:
+Google's CalDAV API does not support the conditional-create header Omarcal
+uses to guarantee that a new resource cannot overwrite one already there.
+
 ## What leaves your computer
 
 | Goes to | When | What |
 | --- | --- | --- |
-| Your calendar server (iCloud) | every sync, and every save | your calendars and events |
+| Your calendar server (iCloud or Google) | every sync, and every supported save | your calendars and events |
+| Google OAuth and Calendar APIs | when connecting Google and refreshing access | browser authorization, account identity, calendar names, colors, and access roles |
 | iCloud Contacts | only if you allow it in Settings → Contacts | reads names and email addresses to suggest invitees |
 | Photon (komoot) or Nominatim (OpenStreetMap) | only if you choose one in Settings → Address search | the address you are typing |
 | GitHub | once a day, unless turned off in Settings → Updates | a request for omarcal's latest release |
@@ -106,10 +150,13 @@ Everything here ships with Omarchy; none of it comes from pip.
 | Path | Holds |
 | --- | --- |
 | `~/.local/state/omarcal/cache.db` | synced events, calendars, accounts, settings, changes waiting to be sent, and — only if you allow it — contact names and addresses |
-| keyring, schema `org.omarchy.omarcal` | app-specific passwords |
+| `~/.config/omarcal/google-client.json` | your private Google Desktop OAuth client configuration |
+| keyring, schema `org.omarchy.omarcal` | iCloud app-specific passwords and Google refresh tokens |
 
 Removing the plugin leaves both; `Disconnect account` in the account form
-deletes an account's calendars, its cached events and its stored password.
+deletes an account's calendars, cached events and stored credential. For
+Google, it also asks Google to revoke the grant and reports if remote
+revocation could not be confirmed.
 
 ## Remove
 

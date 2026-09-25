@@ -511,7 +511,7 @@ class Conflict(unittest.TestCase):
         finally:
             helper.send = original
         self.assertEqual(caught.exception.code, "conflict")
-        self.assertIn("changed on iCloud", caught.exception.message)
+        self.assertIn("changed on the calendar server", caught.exception.message)
 
 
 if __name__ == "__main__":

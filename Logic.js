@@ -432,6 +432,19 @@ function mixColor(from, to, amount) {
            b: from.b + (to.b - from.b) * amount }
 }
 
+// An Apple-style calendar card is a solid, surface-coloured tint rather than
+// a translucent sheet. Pre-composing the two colours here keeps stacked cards
+// opaque while letting the calendar hue remain visible.
+function opaqueTint(color, surface, amount) {
+  var source = parseColor(color), ground = parseColor(surface)
+  if (!source) return String(surface)
+  if (!ground) return String(color)
+  var share = Number(amount)
+  if (!isFinite(share)) share = 0.24
+  share = Math.max(0, Math.min(1, share))
+  return hexOf(mixColor(ground, source, share))
+}
+
 // `foreground` lightened or darkened just enough to reach `minRatio` against
 // `background`. Returns a hex string, or the input unchanged when it already
 // passes or cannot be parsed.
@@ -472,13 +485,15 @@ var PROVIDERS = [
   { match: "mailbox.org", name: "mailbox.org" }
 ]
 
-// What the setup form offers. iCloud only for now — the shape is a list so
-// another provider is a line here and a chip in the form, but nothing else
-// has been tested against a real account, and offering an untested provider
-// is worse than not offering it.
+// Providers supported by the account setup form. Authentication is kept with
+// the provider so the panel can offer the same add-account flow without
+// pretending every service takes a password.
 var PROVIDER_PRESETS = [
-  { name: "iCloud", server: "https://caldav.icloud.com/",
-    hint: "Apple needs an app-specific password, from account.apple.com under Sign-In and Security." }
+  { name: "iCloud", key: "icloud", auth: "password",
+    server: "https://caldav.icloud.com/",
+    hint: "Apple needs an app-specific password, from account.apple.com under Sign-In and Security." },
+  { name: "Google", key: "google", auth: "oauth", server: "",
+    hint: "Sign in with Google in your browser to connect your calendars." }
 ]
 
 // How to get an app-specific password out of Apple, step by step. Kept here
@@ -515,8 +530,49 @@ var APP_PASSWORD_STEPS = [
     link: "" }
 ]
 
+// Google makes the person create an OAuth client because this public plugin
+// does not ship one developer's shared client ID. Keep the console vocabulary
+// here in the same order it appears in Google's current Auth Platform.
+var GOOGLE_OAUTH_STEPS = [
+  { title: "Create or choose a Google Cloud project",
+    text: "Use a project you control. The OAuth client and its API access will belong to that project.",
+    link: "https://console.cloud.google.com/" },
+  { title: "Enable the Google Calendar API",
+    text: "Open the Calendar API page for that project and choose Enable.",
+    link: "https://console.cloud.google.com/apis/library/calendar-json.googleapis.com" },
+  { title: "Enable the CalDAV API",
+    text: "Open the CalDAV API page for the same project and choose Enable. Omarcal uses this interface to sync the events inside each calendar.",
+    link: "https://console.cloud.google.com/apis/library/caldav.googleapis.com" },
+  { title: "Set up the Google Auth Platform",
+    text: "Under Branding, enter an app name, support email and contact email. Under Audience, use Internal only for your Google Workspace organisation; otherwise use External.",
+    link: "https://console.cloud.google.com/auth/overview" },
+  { title: "Add yourself as a test user",
+    text: "If the Audience is External and the app is in Testing, open Audience and add the Google account whose calendars you will connect.",
+    link: "" },
+  { title: "Add Calendar access",
+    text: "Under Data Access, add the scope https://www.googleapis.com/auth/calendar so Omarcal can sync and update calendars.",
+    link: "" },
+  { title: "Create a Desktop app client",
+    text: "Open Clients, choose Create client, select Desktop app, give it a name such as Omarcal, and create it.",
+    link: "https://console.cloud.google.com/auth/clients" },
+  { title: "Download the JSON file",
+    text: "Download that client's JSON credentials. Keep the file private; Omarcal will copy it into its own configuration folder.",
+    link: "" },
+  { title: "Import it here",
+    text: "Close this guide, choose Import Google credentials, select the downloaded JSON file, then choose Continue with Google.",
+    link: "" }
+]
+
 function appPasswordSteps() {
   return APP_PASSWORD_STEPS
+}
+
+function accountHelp(provider) {
+  if (providerOption(provider) === "Google")
+    return { title: "Google OAuth JSON", meta: "Google Calendar",
+      steps: GOOGLE_OAUTH_STEPS }
+  return { title: "App-specific password", meta: "iCloud",
+    steps: APP_PASSWORD_STEPS }
 }
 
 function providerPresets() {
@@ -528,7 +584,50 @@ function providerPresets() {
 function presetFor(name) {
   for (var i = 0; i < PROVIDER_PRESETS.length; i++)
     if (PROVIDER_PRESETS[i].name === name) return PROVIDER_PRESETS[i]
-  return PROVIDER_PRESETS[PROVIDER_PRESETS.length - 1]
+  return PROVIDER_PRESETS[0]
+}
+
+function providerKey(name) {
+  return presetFor(name).key
+}
+
+function providerOption(account) {
+  var raw = account && typeof account === "object"
+    ? String(account.provider || "") : String(account || "")
+  var value = raw.toLowerCase()
+  if (value === "google" || value === "google-calendar") return "Google"
+  if (value === "icloud" || value === "apple") return "iCloud"
+  if (account && typeof account === "object")
+    return providerName(account.server || raw)
+  return providerName(raw)
+}
+
+function accountProviderName(account) {
+  return providerOption(account)
+}
+
+// Account rows and calendar rows share a stable provider-qualified account
+// ID. The user comparison is retained only for pre-ID caches; new provider
+// IDs never fall back to an email match, so same-address accounts stay apart.
+function calendarsForAccount(calendars, accountId, user) {
+  var id = String(accountId || "")
+  var legacyUser = String(user || "")
+  var rows = calendars || []
+  var allowLegacy = !id || id === legacyUser
+  return rows.filter(function (calendar) {
+    var owner = String(calendar.accountId || calendar.account || "")
+    return (id && owner === id) || (allowLegacy && legacyUser && owner === legacyUser)
+  })
+}
+
+function accountEmailForId(accounts, accountId) {
+  var id = String(accountId || "")
+  var rows = accounts || []
+  for (var i = 0; i < rows.length; i++) {
+    if (String(rows[i].id || rows[i].user || "") === id)
+      return String(rows[i].user || "")
+  }
+  return id
 }
 
 // What is wrong with the form, or "" when nothing is. Said as a sentence,
@@ -553,6 +652,11 @@ function accountProblem(user, server, password, passwordHeld) {
   return ""
 }
 
+function accountProblemForProvider(provider, user, server, password, passwordHeld) {
+  if (providerOption(provider) === "Google") return ""
+  return accountProblem(user, server, password, passwordHeld)
+}
+
 // A result from a dismissed account form must not change a form opened later.
 // Request ids are local to the open panel; -1 means there is no live attempt.
 function accountRequestMatches(activeRequestId, resultRequestId) {
@@ -571,6 +675,23 @@ function accountSetupMessage(state) {
     return String(state.addError)
   if (Number(state.activeRequestId) >= 0) return ""
   return state.hasInput ? String(state.problem || "") : ""
+}
+
+// Map the helper's file-import response to the three states the setup form
+// needs to distinguish. Dismissing the desktop picker is a normal outcome.
+function googleClientImportResult(payload) {
+  if (!payload || typeof payload !== "object")
+    return { state: "error", message: "Google credential import did not report back" }
+  if (payload.ok !== true) {
+    var failure = singleLine(payload.error || "Google OAuth credentials could not be imported")
+    return { state: "error", message: failure.length > 300
+      ? failure.slice(0, 297) + "…" : failure }
+  }
+  if (payload.imported === false) return { state: "cancelled", message: "" }
+  if (payload.imported === true)
+    return { state: "imported",
+      message: "Google OAuth client imported. Continue with Google to sign in." }
+  return { state: "error", message: "Google credential import did not report back" }
 }
 
 function providerName(server) {
@@ -1119,15 +1240,25 @@ function blockGeometry(block, hourHeight, minimumHeight, win) {
   return { y: Math.round(top), height: Math.round(Math.max(height, floor)) }
 }
 
-// The horizontal share of one block: which of its cluster's columns it takes
-// and how wide that column is, with `gap` left between neighbours.
-function blockColumn(block, width, gap) {
+// The horizontal share of one block. Overlapping appointments cascade instead
+// of being squeezed into equal slivers: the first keeps the full rail and each
+// later lane reveals a shoulder of the card below it. Even a very busy cluster
+// leaves the front card a useful share of the day. `minimumWidth` lets the Day
+// view protect a practical text width; narrow Week columns use the proportional
+// floor alone.
+function blockColumn(block, width, gap, minimumWidth) {
   var lanes = Math.max(1, block.lanes)
-  var span = width / lanes
-  var pad = lanes > 1 ? (gap === undefined ? 0 : gap) : 0
+  if (lanes === 1) return { x: 0, width: Math.max(1, Math.round(width)) }
+
+  var pad = gap === undefined ? 0 : Math.max(0, gap)
+  var usable = Math.max(1, width - pad)
+  var floor = Math.max(usable * 0.58, minimumWidth || 0)
+  floor = Math.min(usable, floor)
+  var step = (usable - floor) / Math.max(1, lanes - 1)
+  var x = block.lane * step
   return {
-    x: Math.round(block.lane * span),
-    width: Math.max(1, Math.round(span - pad))
+    x: Math.round(x),
+    width: Math.max(1, Math.round(usable - x))
   }
 }
 
@@ -2185,7 +2316,7 @@ function shortDate(key) {
 }
 
 // Where a new event goes: the calendar the person chose in settings, while
-// it can still be written to; otherwise the busiest writable calendar of
+// it can still accept creates; otherwise the busiest writable calendar of
 // the first account — the one in use, rather than the first by name, which
 // put new events in Birthdays, and within one account, so a second account
 // with a busier calendar does not take them over. Failing that, the busiest
@@ -2198,11 +2329,11 @@ function defaultCalendar(calendars, chosen, primaryAccount) {
   var best = "", most = -1, bestHere = "", mostHere = -1
   for (var i = 0; i < (calendars || []).length; i++) {
     var cal = calendars[i]
-    if (cal.enabled === false || cal.readonly) continue
+    if (!canCreateCalendar(cal)) continue
     if (chosen && cal.url === chosen) return chosen
     var count = Number(cal.objects) || 0
     if (count > most) { most = count; best = cal.url }
-    if ((cal.account || "") === (primaryAccount || "") && count > mostHere) {
+    if (calendarAccountId(cal) === (primaryAccount || "") && count > mostHere) {
       mostHere = count
       bestHere = cal.url
     }
@@ -2747,26 +2878,67 @@ function scopeChoices(event, changes) {
   return seriesOnly ? SCOPE_OPTIONS.slice(1) : SCOPE_OPTIONS.slice()
 }
 
-// Which calendars an event can be written into: on, and not read-only.
-// The one it is in stays on the list whatever it is, so the dropdown never
-// opens on a value it does not have.
+// Splitting a series creates a second resource. Do not offer that operation
+// when the provider cannot safely create, while retaining edits that update
+// the existing resource (including an edit to the whole series).
+function scopeChoicesForCalendar(event, changes, calendar) {
+  var choices = scopeChoices(event, changes)
+  if (calendar && calendar.capabilities
+      && calendar.capabilities.create === false)
+    choices = choices.filter(function (choice) { return choice.value !== "following" })
+  return choices
+}
+
+// Which calendars can safely receive an event write: on and not read-only.
+// A provider that cannot safely create is not a move target, but an existing
+// event stays selectable in its current calendar so direct edits remain open.
 //
 // With more than one account on the list, each row says whose it is — two
 // calendars called Personal are otherwise the same row twice. With one, it
 // would only repeat the same address down the side.
 function editableCalendars(calendars, currentUrl) {
+  return calendarOptions(calendars, currentUrl, false)
+}
+
+function creatableCalendars(calendars, currentUrl) {
+  return calendarOptions(calendars, currentUrl, true)
+}
+
+function canCreateCalendar(calendar) {
+  return !!calendar && calendar.enabled !== false && !calendar.readonly
+      && !(calendar.capabilities && calendar.capabilities.create === false)
+}
+
+function calendarAccountId(calendar) {
+  return String(calendar && (calendar.accountId || calendar.account) || "")
+}
+
+function calendarAccountLabel(calendar) {
+  if (!calendar) return ""
+  var label = String(calendar.accountLabel || calendar.accountUser || "")
+  if (label) return singleLine(label)
+  var owner = calendarAccountId(calendar)
+  if (/^google:/i.test(owner)) return "Google account"
+  if (/^icloud:/i.test(owner)) return "iCloud account"
+  return singleLine(owner)
+}
+
+function calendarOptions(calendars, currentUrl, createOnly) {
   var out = [], accounts = {}
   for (var i = 0; i < (calendars || []).length; i++) {
     var cal = calendars[i]
-    var usable = cal.enabled !== false && !cal.readonly
-    if (usable || cal.url === currentUrl) {
+    var usable = createOnly ? canCreateCalendar(cal)
+                            : cal.enabled !== false && !cal.readonly
+                              && !(cal.capabilities && cal.capabilities.create === false)
+    if (usable || (!createOnly && cal.url === currentUrl)) {
       out.push({ value: cal.url, label: singleLine(cal.name), color: cal.color || "",
-                 account: cal.account || "" })
-      accounts[cal.account || ""] = true
+                 account: calendarAccountId(cal), accountLabel: calendarAccountLabel(cal) })
+      accounts[calendarAccountId(cal)] = true
     }
   }
   var several = Object.keys(accounts).length > 1
-  for (var o = 0; o < out.length; o++) out[o].note = several ? out[o].account : ""
+  for (var o = 0; o < out.length; o++)
+    out[o].note = several ? out[o].accountLabel : ""
   return out
 }
 
@@ -2783,8 +2955,8 @@ function calendarOf(calendars, url) {
 function moveNote(calendars, fromUrl, toUrl) {
   if (!fromUrl || !toUrl || fromUrl === toUrl) return ""
   var from = calendarOf(calendars, fromUrl), to = calendarOf(calendars, toUrl)
-  if (!from || !to || (from.account || "") === (to.account || "")) return ""
-  return "This moves the event to " + (to.account || "another account")
+  if (!from || !to || calendarAccountId(from) === calendarAccountId(to)) return ""
+  return "This moves the event to " + (calendarAccountLabel(to) || "another account")
        + ". It is added there and deleted here: invitees are invited again "
        + "from that account, and attachments stay behind."
 }
@@ -2795,20 +2967,46 @@ function moveNote(calendars, fromUrl, toUrl) {
 function actionPrompt(action, scopes, changes) {
   if (action === "discard")
     return "The changes to this event haven\u2019t been saved. Discarding them can\u2019t be undone."
-  var count = (scopes || []).length
+  var values = (scopes || []).map(function (scope) { return scope.value })
+  var hasThis = values.indexOf("this") !== -1
+  var hasFollowing = values.indexOf("following") !== -1
+  var hasAll = values.indexOf("all") !== -1
   var verb = action === "delete" ? "Delete" : "Change"
   var mails = action === "save" && (changes || []).indexOf("invitees") !== -1
     ? " iCloud emails anyone added or removed." : ""
-  if (count === 0)
+  if (!values.length)
     return action === "delete"
       ? "This deletes the event from iCloud and from every device that syncs with it."
       : mails.trim()
-  if (count === 3)
+  if (hasThis && hasFollowing && hasAll)
     return "This event repeats. " + verb + " only this one, this one and every "
          + "one after it, or the whole series?" + mails
-  return "This event repeats, and how it repeats, which calendar it is in and "
-       + "its attachments belong to the whole series. " + verb + " this one and every one after "
-       + "it, or all of them?" + mails
+  if (hasThis && hasAll)
+    return "This event repeats. " + verb + " only this one or all of them?" + mails
+  if (hasFollowing && hasAll)
+    return "This event repeats, and how it repeats, which calendar it is in and "
+         + "its attachments belong to the whole series. " + verb + " this one and every one after "
+         + "it, or all of them?" + mails
+  if (hasAll)
+    return "This event repeats, and this change belongs to the whole series. "
+         + verb + " every occurrence?" + mails
+  if (hasFollowing)
+    return "This event repeats. " + verb + " this one and every one after it?" + mails
+  return "This event repeats. " + verb + " this occurrence?" + mails
+}
+
+function accountResponseNotice(payload) {
+  var result = payload || {}
+  var warnings = result.warnings || []
+  for (var i = 0; i < warnings.length; i++) {
+    var warning = singleLine(warnings[i])
+    if (warning) return warning
+  }
+  var warning = singleLine(result.warning || "")
+  if (warning) return warning
+  if (result.calendarConflicts && result.calendarConflicts.length)
+    return "Some calendars are already connected to another account and were left with their existing owner."
+  return ""
 }
 
 // -------------------------------------------------------------- places

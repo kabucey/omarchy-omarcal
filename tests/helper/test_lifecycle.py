@@ -38,7 +38,8 @@ class Lifecycle(unittest.TestCase):
 
     def add_accounts(self):
         self.conn.execute(
-            "INSERT INTO accounts(user,server) VALUES(?,?)", (ACCOUNT, helper.ICLOUD)
+            "INSERT INTO accounts(id,user,identity,provider,server) VALUES(?,?,?,?,?)",
+            (ACCOUNT, ACCOUNT, ACCOUNT.casefold(), "icloud", helper.ICLOUD),
         )
         self.conn.execute(
             "INSERT INTO calendars(url,name,account) VALUES(?,?,?)",

@@ -26,7 +26,7 @@ CARDS = (
     "item1.X-ABLabel:_$!<Work>!$_\r\nEMAIL;type=HOME:Sam.Home@example.org\r\n"
     "TEL;type=CELL:+1 555 0100\r\nADR;type=HOME:;;1 Main St;Town;;;\r\n"
     "NOTE:private\r\nEND:VCARD\r\n"
-    "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:O\\, Brien\; Pat\r\n"
+            "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:O\\, Brien\\; Pat\r\n"
     "EMAIL:mailto:pat@exam\r\n ple.com\r\nEMAIL:PAT@EXAMPLE.COM\r\nEND:VCARD\r\n"
     "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:No Address\r\nTEL:+1 555 0101\r\nEND:VCARD\r\n"
 )
@@ -82,7 +82,10 @@ class RemovedAccount(unittest.TestCase):
         folder = tempfile.TemporaryDirectory()
         conn = sqlite3.connect(os.path.join(folder.name, "c.db"))
         conn.executescript(helper.SCHEMA)
-        conn.execute("INSERT INTO accounts(user, server) VALUES('me@a', 'https://caldav.icloud.com/')")
+        conn.execute(
+            "INSERT INTO accounts(id,user,identity,provider,server) "
+            "VALUES('me@a','me@a','me@a','icloud','https://caldav.icloud.com/')"
+        )
         conn.execute("INSERT INTO contacts VALUES('me@a', 'Sam', 'sam@example.com')")
         conn.execute("INSERT INTO contacts VALUES('me@b', 'Jo', 'jo@example.com')")
         conn.execute("INSERT INTO contact_state(account, error) VALUES('me@a', 'old error')")

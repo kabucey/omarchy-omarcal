@@ -90,7 +90,10 @@ class FakeSession:
         if "calendar-multiget" not in body:
             self.report_calls += 1
             status = self.report_statuses.pop(0) if self.report_statuses else 207
-            return status, self.reports[url] if status in (200, 207) else b""
+            report = self.reports[url]
+            if isinstance(report, list):
+                report = report.pop(0)
+            return status, report if status in (200, 207) else b""
         with self.lock:
             self.active += 1
             self.max_active = max(self.max_active, self.active)
@@ -100,6 +103,15 @@ class FakeSession:
             if self.multi_mode == "http500":
                 return 500, b""
             requested = [el.text for el in ET.fromstring(body).findall("d:href", helper.NS)]
+            if self.multi_mode == "missing":
+                root = ET.Element("{DAV:}multistatus")
+                missing = ET.SubElement(root, "{DAV:}response")
+                ET.SubElement(missing, "{DAV:}href").text = requested[0]
+                ET.SubElement(missing, "{DAV:}status").text = "HTTP/1.1 404 Not Found"
+                present = [(href, '"new"', EVENT) for href in requested[1:]]
+                for response in ET.fromstring(multiget_xml(present)):
+                    root.append(response)
+                return 207, ET.tostring(root)
             entries = [(href, '"new"', EVENT) for href in requested]
             if self.multi_mode == "partial" and entries:
                 entries = entries[:-1]
@@ -275,6 +287,47 @@ class SyncBoundary(unittest.TestCase):
         self.assertEqual(self.conn.execute(
             "SELECT ctag,token FROM calendars WHERE url=?", (self.cal["url"],)).fetchone(),
             ("new-ctag", "recovered-token"))
+
+    def test_limited_sync_report_follows_continuation_token_before_committing(self):
+        first = report_xml([
+            ("/cal0/first.ics", '"v1"', ""),
+            ("/cal0/", "", 507),
+        ], "page-one-token")
+        second = report_xml([
+            ("/cal0/second.ics", '"v1"', ""),
+        ], "complete-token")
+        session = self.use_session({self.cal["url"]: [first, second]})
+
+        (outcome,) = self.run_sync()
+
+        self.assertTrue(outcome["ok"])
+        self.assertEqual(session.report_calls, 2)
+        self.assertEqual(self.conn.execute(
+            "SELECT url FROM objects ORDER BY url").fetchall(), [
+                (self.cal["url"] + "first.ics",),
+                (self.cal["url"] + "second.ics",),
+            ])
+        self.assertEqual(self.conn.execute(
+            "SELECT token FROM calendars WHERE url=?", (self.cal["url"],)).fetchone()[0],
+            "complete-token")
+
+    def test_event_removed_between_report_and_multiget_does_not_fail_sync(self):
+        vanished = self.cal["url"] + "vanished.ics"
+        present = self.cal["url"] + "present.ics"
+        self.conn.execute("INSERT INTO objects(url,calendar,etag,ics,uid) VALUES(?,?,?,?,?)",
+                          (vanished, self.cal["url"], '"old"', "old", "vanished"))
+        report = report_xml([
+            ("/cal0/vanished.ics", '"changed"', ""),
+            ("/cal0/present.ics", '"new"', ""),
+        ])
+        self.use_session({self.cal["url"]: report}, "missing")
+
+        (outcome,) = self.run_sync()
+
+        self.assertTrue(outcome["ok"])
+        self.assertEqual(outcome["removedCount"], 1)
+        self.assertEqual(self.conn.execute(
+            "SELECT url FROM objects ORDER BY url").fetchall(), [(present,)])
 
 
 class DavOriginBoundary(unittest.TestCase):

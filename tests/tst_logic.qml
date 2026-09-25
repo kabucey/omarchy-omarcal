@@ -465,6 +465,14 @@ TestCase {
     compare(Logic.contrastRatio("#ffffff", "#ffffff"), 1)
   }
 
+  // Event fills are pre-composed, not transparent: a card above another card
+  // must look the same as one above the calendar surface.
+  function test_opaque_tint_blends_to_a_solid_colour() {
+    compare(Logic.opaqueTint("#ff0000", "#000000", 0.25), "#400000")
+    compare(Logic.opaqueTint("#ff0000", "#000000", 0), "#000000")
+    compare(Logic.opaqueTint("#ff0000", "#000000", 1), "#ff0000")
+  }
+
   // The real numbers from the Hackerman theme, which is why this exists.
   function test_detects_the_unreadable_theme_muted() {
     verify(Logic.contrastRatio("#2d3450", "#0B0C16") < 2.0)
@@ -556,9 +564,33 @@ TestCase {
     verify(all.indexOf("once") >= 0, "does not say the password is shown once")
   }
 
-  // iCloud only for now, and the form is built from this list.
-  function test_only_icloud_is_offered() {
-    compare(Logic.providerPresets(), ["iCloud"])
+  // This guide is the only setup path available before the JSON exists. Keep
+  // the required Google Cloud decisions and the handoff back to Omarcal in it.
+  function test_google_help_covers_the_complete_desktop_client_flow() {
+    var guide = Logic.accountHelp("Google")
+    var all = guide.steps.map(function (step) {
+      return step.title + " " + step.text + " " + (step.link || "")
+    }).join(" ")
+    verify(guide.steps.length >= 7, "too few steps to reach a downloaded client")
+    verify(all.indexOf("Calendar API") >= 0, "does not enable the Calendar API")
+    verify(all.indexOf("CalDAV API") >= 0
+           && all.indexOf("caldav.googleapis.com") >= 0,
+           "does not enable the CalDAV API")
+    verify(all.indexOf("External") >= 0 && all.indexOf("test user") >= 0,
+           "does not explain External testing access")
+    verify(all.indexOf("https://www.googleapis.com/auth/calendar") >= 0,
+           "does not name the Calendar permission")
+    verify(all.indexOf("Desktop app") >= 0, "does not create the right client type")
+    verify(all.indexOf("Download") >= 0 && all.indexOf("Import Google credentials") >= 0,
+           "does not bring the downloaded JSON back to Omarcal")
+  }
+
+  // The visible provider choices identify their corresponding sign-in paths.
+  function test_supported_provider_presets_match_their_auth_flows() {
+    compare(Logic.providerPresets(), ["iCloud", "Google"])
+    compare(Logic.presetFor("iCloud").auth, "password")
+    compare(Logic.presetFor("Google").auth, "oauth")
+    compare(Logic.providerKey("Google"), "google")
   }
 
   function test_preset_carries_a_server_and_a_hint() {
@@ -609,6 +641,18 @@ TestCase {
     compare(Logic.accountProblem("me@example.com", "https://caldav.icloud.com/", "pw"), "")
   }
 
+  function test_google_setup_does_not_require_a_password() {
+    compare(Logic.accountProblemForProvider("Google", "", "", "", false), "")
+    compare(Logic.accountProblemForProvider(
+      "iCloud", "me@example.com", "https://caldav.icloud.com/", "", false),
+      "A password is needed.")
+    compare(Logic.accountSetupMessage({
+      open: true, hasInput: true,
+      problem: Logic.accountProblemForProvider("Google", "", "", "", false),
+      activeRequestId: -1
+    }), "")
+  }
+
   // Submitted state owns the feedback until its result arrives. A completed
   // request from a dismissed form cannot surface on the form opened afterward.
   function test_account_feedback_is_scoped_to_the_open_submission() {
@@ -632,12 +676,67 @@ TestCase {
     }), "")
   }
 
+  // The helper reports cancellation as a successful command with no import;
+  // only malformed or failed responses should leave an error on the form.
+  function test_google_client_import_distinguishes_success_cancel_and_error() {
+    var imported = Logic.googleClientImportResult({ ok: true, imported: true })
+    compare(imported.state, "imported")
+    verify(imported.message.indexOf("Continue with Google") >= 0)
+
+    var cancelled = Logic.googleClientImportResult({ ok: true, imported: false })
+    compare(cancelled.state, "cancelled")
+    compare(cancelled.message, "")
+
+    var failed = Logic.googleClientImportResult({ ok: false, error: "bad\nconfiguration" })
+    compare(failed.state, "error")
+    compare(failed.message, "bad, configuration")
+    compare(Logic.googleClientImportResult(null).state, "error")
+  }
+
   // ------------------------------------------------------------- provider
+
+  function test_calendar_settings_are_scoped_to_stable_account_ids() {
+    var rows = [
+      { url: "icloud-calendar", account: "same@example.com" },
+      { url: "google-calendar", account: "google:subject-1" },
+      { url: "other-google-calendar", account: "google:subject-2" }
+    ]
+    compare(Logic.calendarsForAccount(rows, "google:subject-1", "same@example.com")
+      .map(function (row) { return row.url }).join(","), "google-calendar")
+    compare(Logic.calendarsForAccount(rows, "same@example.com", "same@example.com")
+      .map(function (row) { return row.url }).join(","), "icloud-calendar")
+  }
+
+  function test_account_email_uses_stable_id_before_matching_email() {
+    var accounts = [
+      { id: "icloud:same@example.com", user: "same@example.com", provider: "icloud" },
+      { id: "google:subject-1", user: "same@example.com", provider: "google" }
+    ]
+    compare(Logic.accountEmailForId(accounts, "google:subject-1"), "same@example.com")
+    compare(Logic.accountEmailForId(accounts, "missing-id"), "missing-id")
+  }
 
   function test_provider_names_the_known_services() {
     compare(Logic.providerName("https://caldav.icloud.com/"), "iCloud")
     compare(Logic.providerName("https://p99-caldav.icloud.com:443/"), "iCloud")
     compare(Logic.providerName("https://caldav.fastmail.com/"), "Fastmail")
+  }
+
+  function test_account_provider_prefers_the_explicit_provider_field() {
+    compare(Logic.accountProviderName({ id: "google:sub", user: "me@example.com",
+                                       provider: "google", server: "" }), "Google")
+    compare(Logic.accountProviderName({ id: "apple:me", user: "me@example.com",
+                                       provider: "icloud", server: "" }), "iCloud")
+  }
+
+  function test_successful_account_warnings_are_not_discarded() {
+    compare(Logic.accountResponseNotice({
+      warnings: ["Some calendars kept their existing owner."],
+      calendarConflicts: ["calendar-a"]
+    }), "Some calendars kept their existing owner.")
+    compare(Logic.accountResponseNotice({ calendarConflicts: ["calendar-a"] }),
+      "Some calendars are already connected to another account and were left with their existing owner.")
+    compare(Logic.accountResponseNotice({}), "")
   }
 
   function test_provider_falls_back_to_the_host_name() {

@@ -99,7 +99,9 @@ Panel {
     ? Logic.draftChanges(draft, draftBase) : []
   readonly property string draftProblem: draft ? Logic.draftProblem(draft, inviteeText) : ""
   readonly property var editCalendars: draft
-    ? Logic.editableCalendars(calendars, draft.calendarUrl) : []
+    ? (creating
+        ? Logic.creatableCalendars(calendars, draft.calendarUrl)
+        : Logic.editableCalendars(calendars, draft.calendarUrl)) : []
 
   // The viewer's own zone: what a new event's times are in, and the zone
   // the pickers offer first.
@@ -109,7 +111,8 @@ Panel {
   property bool creating: false
   // Where a new event goes: the one chosen in settings, or the busiest.
   readonly property string newEventCalendar: Logic.defaultCalendar(
-    calendars, String(pref("defaultCalendar", "")), service ? service.account : "")
+    calendars, String(pref("defaultCalendar", "")),
+    service ? (service.accountId || service.account) : "")
 
   // The form, on a blank event for the selected day. The column the viewer
   // uses holds it, so it opens where an event would be read.
@@ -144,7 +147,7 @@ Panel {
     if (!viewerLoaded || newEventCalendar === "") return
     var base = Logic.duplicateOf(viewerEvent)
     var writable = false
-    var usable = Logic.editableCalendars(calendars, "")
+    var usable = Logic.creatableCalendars(calendars, "")
     for (var i = 0; i < usable.length; i++) if (usable[i].value === base.calendarUrl) writable = true
     if (!writable) base.calendarUrl = newEventCalendar
     creating = true
@@ -209,7 +212,10 @@ Panel {
     if (!draftBase) return ""
     var url = draft ? draft.calendarUrl : draftBase.calendarUrl
     for (var i = 0; i < calendars.length; i++)
-      if (calendars[i].url === url) return calendars[i].account || ""
+      if (calendars[i].url === url)
+        return Logic.accountEmailForId(
+          service ? service.accounts : [],
+          calendars[i].accountId || calendars[i].account || "")
     return service ? service.account : ""
   }
   readonly property bool canInviteHere: !!draftBase && Logic.canInvite(draftBase, organizerAccount)
@@ -352,7 +358,9 @@ Panel {
     if (!draft || draftProblem !== "") return
     if (creating) { finishAction("save", ""); return }
     if (draftChanges.length === 0) return
-    var scopes = Logic.scopeChoices(draftBase, draftChanges)
+    var currentCalendar = Logic.calendarOf(calendars, draftBase.calendarUrl)
+    var scopes = Logic.scopeChoicesForCalendar(draftBase, draftChanges,
+                                               currentCalendar)
     if (scopes.length) { pendingScopes = scopes; pendingAction = "save" }
     else finishAction("save", "")
   }
@@ -360,7 +368,8 @@ Panel {
   // A delete always asks, series or not.
   function requestDelete() {
     if (!viewerEditable) return
-    pendingScopes = Logic.scopeChoices(viewerEvent, [])
+    pendingScopes = Logic.scopeChoicesForCalendar(
+      viewerEvent, [], Logic.calendarOf(calendars, viewerEvent.calendarUrl))
     pendingAction = "delete"
   }
 
@@ -614,14 +623,21 @@ Panel {
     else openSettings()
   }
 
-  // The account form, which takes over the calendar column while open. Only
-  // iCloud is offered, so the server is the preset's and never asked for.
+  // The account form, which takes over the calendar column while open.
   property bool setupOpen: false
   property bool setupEditing: false
+  // The import command owns a desktop picker that takes focus, so the popup
+  // steps aside without discarding this form and returns when it closes.
+  property bool preserveSetupWhileClosed: false
+  property bool reopenAfterGoogleClientImport: false
+  property string setupProvider: "iCloud"
   property string setupUser: ""
+  property string setupAccountId: ""
   property string setupPassword: ""
   property bool setupChangingPassword: false
   property bool helpOpen: false
+  property string helpProvider: "iCloud"
+  readonly property var helpGuide: Logic.accountHelp(helpProvider)
   property int setupRequestCounter: 0
   property int setupActiveRequestId: -1
 
@@ -639,13 +655,15 @@ Panel {
   // the answer. Off here is a delete, not a filter, so it is asked about.
   property var pendingForget: null
   readonly property var setupCalendars:
-    setupHasCalendars && service ? service.calendars : []
+    setupHasCalendars && service
+      ? Logic.calendarsForAccount(service.calendars, setupAccountId, setupUser) : []
 
   // Connecting needs a password actually typed: reconnecting with the stored
   // one proves nothing the account list does not already show.
-  readonly property bool canConnect:
-    setupPassword !== "" && Logic.accountProblem(
-      setupUser, setupPreset.server, setupPassword, false) === ""
+  readonly property bool canConnect: setupProvider === "Google"
+    ? !!service && !service.addingAccount && !service.importingGoogleClient
+    : setupPassword !== "" && Logic.accountProblemForProvider(
+        setupProvider, setupUser, setupPreset.server, setupPassword, false) === ""
 
   readonly property var setupChanges: {
     var out = []
@@ -693,57 +711,85 @@ Panel {
   }
 
   function removeAccount() {
-    if (!service || !setupUser) return
+    if (!service || !(setupAccountId || setupUser)) return
     confirmRemove = false
     pendingForget = null
-    service.removeAccount(setupUser)
+    service.removeAccount(setupAccountId || setupUser)
   }
 
   function saveSelection() {
     if (service && setupChanges.length) service.applyCalendarStates(setupChanges)
     closeSetup()
   }
-  readonly property var setupPreset: Logic.presetFor("iCloud")
+  readonly property var setupPreset: Logic.presetFor(setupProvider)
   // An account being edited already holds a password, so the empty box is it
   // not being shown rather than an unanswered field — unless it is being
   // replaced, in which case the new one has to be typed.
   readonly property bool setupPasswordHeld:
-    setupEditing && !setupChangingPassword
+    setupProvider === "iCloud" && setupEditing && !setupChangingPassword
   readonly property bool passwordRevealed:
     !!(service && service.revealedPassword)
-  readonly property string setupProblem: Logic.accountProblem(
+  readonly property string setupProblem: Logic.accountProblemForProvider(
+    setupProvider,
     setupUser, setupPreset.server, setupPassword, setupPasswordHeld)
+
+  function chooseProvider(name) {
+    if (setupEditing || (service && (service.addingAccount
+                                     || service.importingGoogleClient))) return
+    setupProvider = name === "Google" ? "Google" : "iCloud"
+    setupActiveRequestId = -1
+    setupChangingPassword = false
+    setupPassword = ""
+    if (service) {
+      service.addError = ""
+      service.addErrorRequestId = -1
+      service.hidePassword()
+    }
+  }
 
   function openSetup() {
     settingsOpen = false
     searchOpen = false
     setupEditing = false
     setupChangingPassword = false
-    setupActiveRequestId = -1
+    var attachGoogle = service && service.accountAuthProvider === "Google"
+      && service.addingAccount && service.accountAuthRequestId >= 0
+    var showGoogleError = service && service.accountAuthProvider === "Google"
+      && service.addError && service.addErrorRequestId >= 0
+    setupProvider = attachGoogle || showGoogleError ? "Google" : "iCloud"
+    setupActiveRequestId = attachGoogle ? service.accountAuthRequestId
+      : showGoogleError ? service.addErrorRequestId : -1
     setupUser = ""
+    setupAccountId = ""
     setupPassword = ""
     setupSelection = ({})
     setupHasCalendars = false
     confirmRemove = false
     pendingForget = null
     if (service) {
-      service.addError = ""
-      service.addErrorRequestId = -1
+      if (!attachGoogle && !showGoogleError) {
+        service.addError = ""
+        service.addErrorRequestId = -1
+      }
       service.removeError = ""
       service.hidePassword()
     }
     setupOpen = true
   }
 
-  // The same form, filled in: a password cannot be read back out of the
-  // keyring, so editing means entering it again.
-  function editAccount() {
+  // The same form, filled in. iCloud passwords cannot be read back from the
+  // keyring; Google reconnects through the browser instead.
+  function editAccount(account) {
     settingsOpen = false
     searchOpen = false
     setupEditing = true
     setupChangingPassword = false
     setupActiveRequestId = -1
-    setupUser = service ? service.account : ""
+    var selected = account || (service ? service.accountDetails : null)
+    setupUser = selected ? (selected.user || "") : (service ? service.account : "")
+    setupAccountId = selected
+      ? (selected.id || selected.user || "") : (service ? service.accountId : "")
+    setupProvider = selected ? Logic.providerOption(selected) : "iCloud"
     setupPassword = ""
     setupHasCalendars = true
     confirmRemove = false
@@ -764,10 +810,16 @@ Panel {
     if (service) service.hidePassword()
   }
 
+  function openAccountHelp(provider) {
+    helpProvider = provider
+    helpOpen = true
+  }
+
   function closeSetup() {
     setupOpen = false
     setupActiveRequestId = -1
     setupChangingPassword = false
+    setupAccountId = ""
     setupPassword = ""
     setupSelection = ({})
     setupHasCalendars = false
@@ -776,10 +828,36 @@ Panel {
     if (service) service.hidePassword()
   }
 
+  function cancelSetup() {
+    if (service && setupActiveRequestId >= 0
+        && service.accountAuthProvider === "Google" && service.addingAccount)
+      service.cancelGoogleAccount(setupActiveRequestId)
+    closeSetup()
+  }
+
+  function importGoogleClient() {
+    if (!service || service.addingAccount || service.importingGoogleClient) return
+    preserveSetupWhileClosed = true
+    reopenAfterGoogleClientImport = true
+    if (!service.importGoogleClient()) {
+      preserveSetupWhileClosed = false
+      reopenAfterGoogleClientImport = false
+      return
+    }
+    close()
+  }
+
   function connectAccount() {
     if (!canConnect || !service || service.addingAccount) return
     setupRequestCounter += 1
     setupActiveRequestId = setupRequestCounter
+    if (setupProvider === "Google") {
+      if (!service.addGoogleAccount(setupActiveRequestId)) {
+        service.addErrorRequestId = setupActiveRequestId
+        service.addError = "A previous Google sign-in is still closing. Try again."
+      }
+      return
+    }
     service.addAccount(setupUser.trim(), setupPreset.server, setupPassword,
                        setupActiveRequestId)
   }
@@ -2394,8 +2472,11 @@ Panel {
     // after the form has already opened. Fill in what was not there yet
     // rather than leaving a blank field and an unseeded list.
     function onAccountChanged() {
-      if (root.setupEditing && root.setupUser === "")
+      if (root.setupEditing && root.setupUser === "") {
         root.setupUser = root.service.account
+        root.setupAccountId = root.service.accountId || root.service.account
+        root.setupProvider = Logic.providerOption(root.service.accountDetails)
+      }
     }
 
     function onCalendarsChanged() {
@@ -2410,6 +2491,13 @@ Panel {
       else root.closeSetup()
     }
 
+    function onGoogleClientImportFinished(imported) {
+      if (!root.reopenAfterGoogleClientImport) return
+      root.reopenAfterGoogleClientImport = false
+      root.preserveSetupWhileClosed = false
+      root.open()
+    }
+
     function onRemoved() { root.closeSetup() }
   }
 
@@ -2418,7 +2506,7 @@ Panel {
     if (opened) { today = new Date(); loadWindow() }
     // Dismissing the card drops the form with it, password included. Leaving
     // it staged would reopen on a half-filled form holding a secret.
-    else closeSetup()
+    else if (!preserveSetupWhileClosed) closeSetup()
   }
   Component.onCompleted: {
     loadWindow()
@@ -2584,63 +2672,67 @@ Panel {
             width: sidebar.width
             spacing: Style.spacing.md
 
-          // Each source is headed by the service it comes from — "iCloud"
-          // rather than a generic "Calendars" — with the account under it.
-          // Upper-cased and lit, like the headings that name the other two
-          // columns: what a column is comes before what is in it, and a
-          // provider read as a brand name sat too close in weight to the
-          // account line under it. Paired the way PanelHero stacks its own
-          // two lines, not spaced like separate sections, with the account's
-          // own settings beside it.
-          Item {
+          // One identity row per connected account. This keeps Google and
+          // iCloud accounts with the same email distinct and lets settings
+          // scope their calendar switches to the account that owns them.
+          Repeater {
+            model: root.service ? root.service.accounts : []
+
+            Item {
+              required property var modelData
+              width: sidebar.width
+              implicitHeight: Math.max(accountLabels.implicitHeight,
+                                       accountEdit.implicitHeight)
+
+              Column {
+                id: accountLabels
+                anchors.left: parent.left
+                anchors.right: accountEdit.left
+                anchors.rightMargin: Style.spacing.md
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(2)
+
+                PanelSectionHeader {
+                  width: parent.width
+                  elide: Text.ElideRight
+                  text: Logic.accountProviderName(modelData).toUpperCase()
+                  color: root.foreground
+                }
+
+                Text {
+                  width: parent.width
+                  elide: Text.ElideRight
+                  textFormat: Text.PlainText
+                  text: modelData.user || "Connected account"
+                  color: root.subdued
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+
+              Button {
+                id: accountEdit
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                width: root.controlSize
+                height: root.controlSize
+                bordered: true
+                iconText: "\uf013"
+                tooltipText: "Account settings"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                onClicked: root.editAccount(modelData)
+              }
+            }
+          }
+
+          Text {
+            visible: !!(root.service && root.service.accounts.length === 0)
             width: sidebar.width
-            implicitHeight: Math.max(accountLabels.implicitHeight,
-                                     accountEdit.implicitHeight)
-
-            Column {
-              id: accountLabels
-              anchors.left: parent.left
-              anchors.right: accountEdit.left
-              anchors.rightMargin: Style.spacing.md
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(2)
-
-              PanelSectionHeader {
-                width: parent.width
-                elide: Text.ElideRight
-                // Upper-cased here rather than in Logic, which answers with
-                // the provider's own spelling for anywhere it is read as a
-                // name rather than used as a heading.
-                text: Logic.providerName(
-                  root.service ? root.service.server : "").toUpperCase()
-                color: root.foreground
-              }
-
-              Text {
-                width: parent.width
-                elide: Text.ElideRight
-                text: root.service && root.service.account
-                      ? root.service.account : "No account"
-                color: root.subdued
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-            }
-
-            Button {
-              id: accountEdit
-              anchors.right: parent.right
-              anchors.verticalCenter: parent.verticalCenter
-              visible: !!(root.service && root.service.account)
-              width: root.controlSize
-              height: root.controlSize
-              bordered: true
-              iconText: "\uf013"
-              tooltipText: "Account settings"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              onClicked: root.editAccount()
-            }
+            text: "No account"
+            color: root.subdued
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
           }
 
           Column {
@@ -3259,7 +3351,7 @@ Panel {
 
                 Picker {
                   width: parent.width
-                  options: Logic.editableCalendars(root.calendars, root.newEventCalendar)
+                  options: Logic.creatableCalendars(root.calendars, root.newEventCalendar)
                   value: root.newEventCalendar
                   onPicked: function (choice) { root.setPref("defaultCalendar", choice) }
                 }
@@ -3268,7 +3360,7 @@ Panel {
                   width: parent.width
                   readonly property string said: Logic.defaultCalendarNote(
                     root.calendars, String(root.pref("defaultCalendar", "")),
-                    root.service ? root.service.account : "")
+                    root.service ? (root.service.accountId || root.service.account) : "")
                   visible: said !== ""
                   wrapMode: Text.WordWrap
                   textFormat: Text.PlainText
@@ -3433,9 +3525,7 @@ Panel {
             anchors.topMargin: root.halfRuleGap
             spacing: Style.spacing.md
 
-            // The provider, shown and not chosen: there is one. Disabled
-            // rather than absent so it is clear what the account will be, and
-            // that more is meant to follow.
+            // The provider determines the sign-in path below.
             Column {
               width: sidebar.width
               spacing: Style.space(2)
@@ -3454,28 +3544,16 @@ Panel {
                   id: providerPick
                   width: parent.width
                   rowHeight: root.fieldHeight
-                  enabled: false
-                  opacity: 0.6
+                  enabled: !root.setupEditing
+                           && !(root.service && (root.service.addingAccount
+                                                 || root.service.importingGoogleClient))
+                  opacity: enabled ? 1.0 : 0.6
                   showLabel: false
                   options: Logic.providerPresets()
-                  value: "iCloud"
+                  value: root.setupProvider
                   foreground: root.foreground
                   fontFamily: root.fontFamily
-                }
-
-                // The Dropdown carries no tooltip of its own, and a disabled
-                // one would swallow the hover anyway, so the reason it cannot
-                // be changed is told from an item above it.
-                MouseArea {
-                  id: providerHover
-                  anchors.fill: parent
-                  hoverEnabled: true
-                  acceptedButtons: Qt.NoButton
-
-                  PanelToolTip {
-                    visible: providerHover.containsMouse
-                    text: "iCloud support only. Other options coming soon."
-                  }
+                  onChanged: function(value) { root.chooseProvider(value) }
                 }
               }
             }
@@ -3485,6 +3563,7 @@ Panel {
             Column {
               width: sidebar.width
               spacing: Style.space(2)
+              visible: root.setupProvider === "iCloud"
 
               Text {
                 width: parent.width
@@ -3509,7 +3588,7 @@ Panel {
                 MouseArea {
                   anchors.fill: parent
                   cursorShape: Qt.PointingHandCursor
-                  onClicked: root.helpOpen = true
+                  onClicked: root.openAccountHelp("iCloud")
                 }
               }
             }
@@ -3517,6 +3596,85 @@ Panel {
             Column {
               width: sidebar.width
               spacing: Style.space(2)
+              visible: root.setupProvider === "Google"
+
+              Text {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+                text: root.setupEditing
+                  ? "Connected as " + root.setupUser
+                    + ". Google access can be revoked from your Google Account."
+                  : "Google asks for permission to read and edit your "
+                    + "calendars. Omarcal uses it to show calendars and change "
+                    + "existing events; creating events on Google calendars "
+                    + "is not supported yet. Sign in with Google in your "
+                    + "browser. Omarcal never sees your Google password, and "
+                    + "you can revoke access from your Google Account."
+                color: root.subdued
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Text {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                text: "How do I get the Google OAuth JSON?"
+                color: Color.accent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.underline: true
+
+                MouseArea {
+                  anchors.fill: parent
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.openAccountHelp("Google")
+                }
+              }
+
+              Button {
+                width: parent.width
+                height: root.controlSize
+                bordered: true
+                iconText: "\uf07c"
+                text: root.service && root.service.importingGoogleClient
+                  ? "Choosing file…" : "Import Google credentials…"
+                enabled: !!root.service && !root.service.importingGoogleClient
+                         && !root.service.addingAccount
+                opacity: enabled ? 1.0 : 0.4
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                onClicked: root.importGoogleClient()
+              }
+
+              Text {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                visible: !!(root.service && root.service.googleClientImportError)
+                textFormat: Text.PlainText
+                text: root.service ? root.service.googleClientImportError : ""
+                color: root.danger
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Text {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                visible: !!(root.service && root.service.googleClientImportNotice)
+                textFormat: Text.PlainText
+                text: root.service ? root.service.googleClientImportNotice : ""
+                color: root.stored
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+            }
+
+            Column {
+              width: sidebar.width
+              spacing: Style.space(2)
+              visible: root.setupProvider === "iCloud"
 
               PanelSectionHeader {
                 width: parent.width
@@ -3537,6 +3695,7 @@ Panel {
             Column {
               width: sidebar.width
               spacing: Style.space(2)
+              visible: root.setupProvider === "iCloud"
 
               PanelSectionHeader {
                 width: parent.width
@@ -3639,9 +3798,12 @@ Panel {
               width: sidebar.width
               height: root.controlSize
               bordered: true
-              iconText: "\uf0c1"
+              iconText: root.setupProvider === "Google" ? "\uf08e" : "\uf0c1"
               text: root.service && root.service.addingAccount
-                ? "Connecting…" : "Connect"
+                ? (root.setupProvider === "Google" ? "Waiting for Google…" : "Connecting…")
+                : (root.setupProvider === "Google"
+                    ? (root.setupEditing ? "Reconnect with Google" : "Continue with Google")
+                    : "Connect")
               enabled: root.canConnect
                        && !(root.service && root.service.addingAccount)
               // qs.Ui's Button does not dim when disabled; omedia dims it
@@ -3657,13 +3819,26 @@ Panel {
             Text {
               width: sidebar.width
               wrapMode: Text.WordWrap
+              visible: root.setupOpen && root.setupProvider === "Google"
+                       && !!(root.service && root.service.addingAccount)
+              textFormat: Text.PlainText
+              text: "Finish signing in to Google in your browser. You can cancel here."
+              color: root.subdued
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Text {
+              width: sidebar.width
+              wrapMode: Text.WordWrap
               visible: root.setupOpen && text !== ""
               textFormat: Text.PlainText
               // Submission state prevents cleared credentials from becoming
               // a validation error while the successful result closes the form.
               text: Logic.accountSetupMessage({
                 open: root.setupOpen,
-                hasInput: !!(root.setupUser || root.setupPassword),
+                hasInput: root.setupProvider === "Google"
+                          || !!(root.setupUser || root.setupPassword),
                 problem: root.setupProblem,
                 activeRequestId: root.setupActiveRequestId,
                 addError: root.service ? root.service.addError : "",
@@ -3696,8 +3871,8 @@ Panel {
               visible: root.confirmRemove
               width: sidebar.width
               wrapMode: Text.WordWrap
-              text: "Its calendars and their cached events go too, and the "
-                  + "stored password is deleted. The calendars stay on iCloud."
+              text: "Its calendars and cached events are removed, along with "
+                  + "the saved sign-in. The calendars remain in your account."
               color: root.subdued
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -3902,7 +4077,7 @@ Panel {
                 text: "Cancel"
                 foreground: root.foreground
                 fontFamily: root.fontFamily
-                onClicked: root.closeSetup()
+                onClicked: root.cancelSetup()
               }
             }
           }
@@ -4329,6 +4504,7 @@ Panel {
                       color: root.foreground
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
+                      font.weight: Font.DemiBold
                     }
 
                     MouseArea {
@@ -4377,11 +4553,16 @@ Panel {
 
                 Rectangle {
                   required property var modelData
+                  readonly property color cardColor: root.colorOf(modelData)
+                  readonly property color cardFill:
+                    Logic.opaqueTint(cardColor, Color.popups.background, 0.24)
+                  readonly property string cardForeground:
+                    Logic.ensureContrast(cardColor, cardFill, 4.5)
                   x: root.hourGutter
                   width: calendarColumn.width - root.hourGutter
                   height: root.slotHeight
                   radius: Style.cornerRadius > 0 ? Style.cornerRadius : Style.space(3)
-                  color: Util.alpha(root.colorOf(modelData), 0.30)
+                  color: cardFill
 
                   Text {
                     anchors.fill: parent
@@ -4391,9 +4572,10 @@ Panel {
                     elide: Text.ElideRight
                     textFormat: Text.PlainText
                     text: Logic.singleLine(modelData.title)
-                    color: root.foreground
+                    color: cardForeground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
+                    font.weight: Font.DemiBold
                   }
 
                   MouseArea {
@@ -4496,7 +4678,14 @@ Panel {
                     readonly property var box: Logic.blockGeometry(
                       modelData, dayView.hourHeight, root.slotHeight, root.dayWindow)
                     readonly property var column: Logic.blockColumn(
-                      modelData, railBody.width - root.hourGutter, root.slotGap * 2)
+                      modelData, railBody.width - root.hourGutter,
+                      root.slotGap * 2, Style.space(112))
+                    readonly property color cardColor:
+                      root.colorOf(modelData.event)
+                    readonly property color cardFill:
+                      Logic.opaqueTint(cardColor, Color.popups.background, 0.24)
+                    readonly property string cardForeground:
+                      Logic.ensureContrast(cardColor, cardFill, 4.5)
 
                     visible: Logic.inWindow(modelData, root.dayWindow)
                     x: root.hourGutter + column.x
@@ -4504,55 +4693,67 @@ Panel {
                     width: column.width
                     height: box.height
                     radius: Style.cornerRadius > 0 ? Style.cornerRadius : Style.space(3)
-                    color: Util.alpha(root.colorOf(modelData.event), 0.22)
+                    color: cardFill
+                    border.width: 0
+                    z: dayEventMouse.containsMouse ? 10000 : index
+
+                    required property int index
+
+                    Rectangle {
+                      x: Style.spacing.xxs
+                      anchors.top: parent.top
+                      anchors.bottom: parent.bottom
+                      anchors.topMargin: Style.spacing.xxs
+                      anchors.bottomMargin: Style.spacing.xxs
+                      width: Style.space(3)
+                      radius: width / 2
+                      color: cardColor
+                    }
 
                     Column {
                       anchors.fill: parent
-                      anchors.margins: Style.spacing.xs
+                      anchors.topMargin: Style.spacing.xs
+                      anchors.bottomMargin: Style.spacing.xs
+                      anchors.leftMargin: Style.spacing.xs + Style.space(5)
+                      anchors.rightMargin: Style.spacing.xs
                       spacing: 0
                       clip: true
 
-                      Row {
-                        spacing: Style.spacing.xs
+                      readonly property bool showRange:
+                        height > root.captionLine * 2.4
 
-                        // A dot, because it has a time — the same mark the
-                        // month and the day list give an appointment.
-                        Rectangle {
-                          anchors.verticalCenter: parent.verticalCenter
-                          width: Style.space(5)
-                          height: width
-                          radius: width / 2
-                          color: root.colorOf(modelData.event)
-                        }
-
-                        Text {
-                          anchors.verticalCenter: parent.verticalCenter
-                          width: parent.parent.width - Style.space(5)
-                                 - Style.spacing.xs
-                          elide: Text.ElideRight
-                          textFormat: Text.PlainText
-                          text: Logic.singleLine(modelData.event.title)
-                          color: root.foreground
-                          font.family: root.fontFamily
-                          font.pixelSize: Style.font.caption
-                        }
+                      Text {
+                        width: parent.width
+                        wrapMode: Text.Wrap
+                        elide: Text.ElideRight
+                        maximumLineCount: Math.max(
+                          1, Math.floor(parent.height / root.captionLine)
+                             - (parent.showRange ? 1 : 0))
+                        textFormat: Text.PlainText
+                        text: Logic.singleLine(modelData.event.title)
+                        color: cardForeground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        font.weight: Font.DemiBold
                       }
 
                       Text {
                         // Only where the block is tall enough to hold it.
-                        visible: parent.height > root.captionLine * 2.4
+                        visible: parent.showRange
                         width: parent.width
                         elide: Text.ElideRight
                         textFormat: Text.PlainText
                         text: Logic.formatRange(modelData.event, root.timeFormat)
-                        color: root.subdued
+                        color: cardForeground
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
                       }
                     }
 
                     MouseArea {
+                      id: dayEventMouse
                       anchors.fill: parent
+                      hoverEnabled: true
                       cursorShape: Qt.PointingHandCursor
                       onClicked: root.openEvent(modelData.event)
                     }
@@ -4688,12 +4889,18 @@ Panel {
 
                 Rectangle {
                   required property var modelData
+                  readonly property color cardColor:
+                    root.colorOf(modelData.event)
+                  readonly property color cardFill:
+                    Logic.opaqueTint(cardColor, Color.popups.background, 0.24)
+                  readonly property string cardForeground:
+                    Logic.ensureContrast(cardColor, cardFill, 4.5)
                   x: root.hourGutter + modelData.startCol * weekView.dayWidth + 1
                   y: Math.round(root.ruleGap / 2) + modelData.lane * root.slotPitch
                   width: modelData.span * weekView.dayWidth - 2
                   height: root.slotHeight
                   radius: Style.cornerRadius > 0 ? Style.cornerRadius : Style.space(3)
-                  color: Util.alpha(root.colorOf(modelData.event), 0.30)
+                  color: cardFill
 
                   Text {
                     anchors.fill: parent
@@ -4704,9 +4911,10 @@ Panel {
                     textFormat: Text.PlainText
                     text: (modelData.continuesBefore ? "◂ " : "")
                           + Logic.singleLine(modelData.event.title)
-                    color: root.foreground
+                    color: cardForeground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
+                    font.weight: Font.DemiBold
                   }
 
                   MouseArea {
@@ -4849,6 +5057,12 @@ Panel {
                           root.dayWindow)
                         readonly property var column: Logic.blockColumn(
                           modelData, weekDay.width - 4, root.slotGap)
+                        readonly property color cardColor:
+                          root.colorOf(modelData.event)
+                        readonly property color cardFill:
+                          Logic.opaqueTint(cardColor, Color.popups.background, 0.24)
+                        readonly property string cardForeground:
+                          Logic.ensureContrast(cardColor, cardFill, 4.5)
 
                         visible: Logic.inWindow(modelData, root.dayWindow)
                         x: 2 + column.x
@@ -4857,39 +5071,66 @@ Panel {
                         height: box.height
                         radius: Style.cornerRadius > 0 ? Style.cornerRadius
                                                        : Style.space(3)
-                        color: Util.alpha(root.colorOf(modelData.event), 0.24)
+                        color: cardFill
+                        border.width: 0
+                        z: weekEventMouse.containsMouse ? 10000 : index
+
+                        required property int index
+
+                        Rectangle {
+                          x: Style.spacing.xxs
+                          anchors.top: parent.top
+                          anchors.bottom: parent.bottom
+                          anchors.topMargin: Style.spacing.xxs
+                          anchors.bottomMargin: Style.spacing.xxs
+                          width: Style.space(3)
+                          radius: width / 2
+                          color: cardColor
+                        }
 
                         Column {
                           anchors.fill: parent
-                          anchors.margins: Style.spacing.xs
+                          anchors.topMargin: Style.spacing.xs
+                          anchors.bottomMargin: Style.spacing.xs
+                          anchors.leftMargin: Style.spacing.xs + Style.space(5)
+                          anchors.rightMargin: Style.spacing.xs
                           spacing: 0
                           clip: true
 
+                          readonly property bool showRange:
+                            height > root.captionLine * 2.4
+
                           Text {
                             width: parent.width
+                            wrapMode: Text.Wrap
                             elide: Text.ElideRight
+                            maximumLineCount: Math.max(
+                              1, Math.floor(parent.height / root.captionLine)
+                                 - (parent.showRange ? 1 : 0))
                             textFormat: Text.PlainText
                             text: Logic.singleLine(modelData.event.title)
-                            color: root.foreground
+                            color: cardForeground
                             font.family: root.fontFamily
                             font.pixelSize: Style.font.caption
                             font.weight: Font.DemiBold
                           }
 
                           Text {
-                            visible: parent.height > root.captionLine * 2.4
+                            visible: parent.showRange
                             width: parent.width
                             elide: Text.ElideRight
                             textFormat: Text.PlainText
                             text: Logic.formatRange(modelData.event, root.timeFormat)
-                            color: root.subdued
+                            color: cardForeground
                             font.family: root.fontFamily
                             font.pixelSize: Style.font.caption
                           }
                         }
 
                         MouseArea {
+                          id: weekEventMouse
                           anchors.fill: parent
+                          hoverEnabled: true
                           cursorShape: Qt.PointingHandCursor
                           onClicked: root.openEvent(modelData.event)
                         }
@@ -4938,11 +5179,14 @@ Panel {
 
           Text {
             id: errorText
-            visible: !!(root.service && root.service.error)
+            visible: !!(root.service && (root.service.notice || root.service.error))
             width: calendarColumn.width
             wrapMode: Text.WordWrap
-            text: root.service ? root.service.error : ""
-            color: root.danger
+            textFormat: Text.PlainText
+            text: root.service
+              ? (root.service.notice || root.service.error) : ""
+            color: root.service && root.service.notice
+              ? root.subdued : root.danger
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
           }
@@ -6539,8 +6783,8 @@ Panel {
 
             ColumnHeader {
               width: parent.width
-              title: "App-specific password"
-              meta: "iCloud"
+              title: root.helpGuide.title
+              meta: root.helpGuide.meta
 
               trailingControl: Component {
                 Button {
@@ -6563,7 +6807,7 @@ Panel {
             Item { width: 1; height: Math.max(0, root.ruleGap - Style.spacing.md * 2) }
 
             Repeater {
-              model: Logic.appPasswordSteps()
+              model: root.helpGuide.steps
 
               Column {
                 required property var modelData

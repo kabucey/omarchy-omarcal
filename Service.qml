@@ -14,8 +14,10 @@ QtObject {
   id: root
 
   property string account: ""
-  // Changes saved while offline and not yet on iCloud, and those iCloud
-  // refused when they were sent — as `status` last reported them.
+  property string accountId: ""
+  property var accountDetails: null
+  // Changes saved while offline and not yet on their account, or refused
+  // when they were sent — as `status` last reported them.
   property int pendingCount: 0
   property var pendingProblems: []
 
@@ -80,11 +82,22 @@ QtObject {
 
   signal eventsLoaded()
   signal accountAdded(int requestId)
+  signal googleClientImportFinished(bool imported)
 
   property bool addingAccount: false
+  // The Google sign-in runs here, rather than in the panel, so hiding the
+  // card does not lose the browser round trip. The request id lets a reopened
+  // form attach to this attempt and rejects stale completions.
+  property string accountAuthProvider: ""
+  property string accountAuthState: "idle"
+  property int accountAuthRequestId: -1
+  property bool importingGoogleClient: false
+  property string googleClientImportError: ""
+  property string googleClientImportNotice: ""
   property string addError: ""
   property int addErrorRequestId: -1
   property string removeError: ""
+  property string notice: ""
   property bool disconnectingAccount: false
   // Only held while the panel is showing it, and dropped the moment it stops.
   property string revealedPassword: ""
@@ -97,6 +110,19 @@ QtObject {
       root.error = fallback
       return null
     }
+  }
+
+  // Brief, non-blocking account notices survive the status/sync refresh that
+  // follows login or disconnect. They are distinct from actionable failures.
+  function showNotice(message) {
+    notice = String(message || "")
+    if (notice) noticeTimeout.restart()
+    else noticeTimeout.stop()
+  }
+
+  property Timer noticeTimeout: Timer {
+    interval: 30000
+    onTriggered: root.notice = ""
   }
 
   // Load occurrences for a window. Cheap — it reads the local cache and
@@ -121,8 +147,14 @@ QtObject {
 
   // Pull from the server, then reload the window. An unchanged ctag makes
   // this nearly free, so it is safe to call on a timer.
+  property bool syncQueued: false
+
   function sync() {
-    if (syncProc.running) return
+    if (syncProc.running) {
+      syncQueued = true
+      return
+    }
+    syncQueued = false
     syncProc.command = [helper, "sync"]
     syncing = true
     syncProc.running = true
@@ -139,12 +171,13 @@ QtObject {
     syncProc.running = true
   }
 
-  // Everything an account brought, and its password with it.
-  function removeAccount(user) {
+  // Everything an account brought, and its saved sign-in with it.
+  function removeAccount(accountId) {
     if (removeProc.running) return
     disconnectingAccount = true
     removeError = ""
-    removeProc.command = [helper, "remove-account", "--user", user]
+    showNotice("")
+    removeProc.command = [helper, "remove-account", "--account-id", accountId]
     removeProc.running = true
   }
 
@@ -167,6 +200,10 @@ QtObject {
         if (!payload) root.removeError = root.error || "the removal did not report back"
         else if (!payload.ok) root.removeError = payload.error || "could not remove it"
         else {
+          // Local removal is complete even when Google could not confirm a
+          // remote token revocation. Keep that informational notice visible
+          // even while the event list and status are refreshed.
+          root.showNotice(Logic.accountResponseNotice(payload))
           root.removeError = ""
           root.removed()
         }
@@ -430,14 +467,82 @@ QtObject {
   // password goes over stdin, never argv — argv is readable from /proc by
   // anything running as this user, which is how the network panel does it too.
   function addAccount(user, server, password, requestId) {
-    if (loginProc.running) return
+    if (addingAccount || loginProc.running || googleLoginProc.running) return
     addError = ""
     addErrorRequestId = requestId
     addingAccount = true
+    accountAuthProvider = "iCloud"
+    accountAuthState = "connecting"
+    accountAuthRequestId = requestId
     loginProc.requestId = requestId
+    loginProc.timedOut = false
+    loginProc.cancelled = false
     loginProc.secret = password
     loginProc.command = [helper, "login", "--user", user, "--server", server]
     loginProc.running = true
+  }
+
+  function addGoogleAccount(requestId) {
+    if (addingAccount || importingGoogleClient || loginProc.running
+        || googleLoginProc.running || googleClientImportProc.running) return false
+    addError = ""
+    addErrorRequestId = requestId
+    showNotice("")
+    addingAccount = true
+    accountAuthProvider = "Google"
+    accountAuthState = "waiting"
+    accountAuthRequestId = requestId
+    googleLoginProc.requestId = requestId
+    googleLoginProc.timedOut = false
+    googleLoginProc.cancelled = false
+    googleLoginProc.completed = false
+    googleLoginProc.command = [helper, "login", "--provider", "google"]
+    googleLoginProc.running = true
+    return true
+  }
+
+  function importGoogleClient() {
+    if (addingAccount || importingGoogleClient || loginProc.running
+        || googleLoginProc.running || googleClientImportProc.running) return false
+    googleClientImportError = ""
+    googleClientImportNotice = ""
+    importingGoogleClient = true
+    googleClientImportProc.command = [helper, "import-google-client"]
+    googleClientImportProc.running = true
+    return true
+  }
+
+  function failGoogleLogin(requestId, message) {
+    if (googleLoginProc.cancelled || googleLoginProc.timedOut
+        || requestId !== accountAuthRequestId)
+      return
+    googleLoginProc.completed = true
+    root.googleLoginTimeout.stop()
+    root.addingAccount = false
+    root.accountAuthState = "error"
+    root.accountAuthRequestId = -1
+    root.addErrorRequestId = requestId
+    var safeMessage = Logic.singleLine(message || "Google sign-in could not be started")
+    root.addError = safeMessage.length > 300
+      ? safeMessage.slice(0, 297) + "…" : safeMessage
+  }
+
+  function cancelGoogleAccount(requestId) {
+    if (accountAuthProvider !== "Google"
+        || accountAuthRequestId !== requestId)
+      return false
+    googleLoginTimeout.stop()
+    googleLoginProc.cancelled = true
+    googleLoginProc.completed = true
+    // Invalidate before stopping the helper so its exit cannot win the race.
+    accountAuthRequestId = -1
+    accountAuthState = "idle"
+    accountAuthProvider = ""
+    addingAccount = false
+    addError = ""
+    addErrorRequestId = -1
+    if (googleLoginProc.running) googleLoginProc.running = false
+    return true
   }
 
   // Nothing the helper does should take this long; if it somehow does, the
@@ -449,6 +554,8 @@ QtObject {
       loginProc.timedOut = true
       loginProc.running = false
       root.addingAccount = false
+      root.accountAuthState = "error"
+      root.accountAuthRequestId = -1
       root.addErrorRequestId = loginProc.requestId
       root.addError = "the server did not answer in time"
     }
@@ -458,6 +565,7 @@ QtObject {
     property string secret: ""
     property int requestId: -1
     property bool timedOut: false
+    property bool cancelled: false
     running: false
     stdinEnabled: true
     stdout: StdioCollector { id: loginOut; waitForEnd: true }
@@ -474,23 +582,122 @@ QtObject {
         timedOut = false
         return
       }
+      if (cancelled) {
+        cancelled = false
+        return
+      }
       var payload = root.parse(loginOut.text, "the helper did not report back")
       if (!payload) {
+        root.accountAuthState = "error"
+        root.accountAuthRequestId = -1
         root.addErrorRequestId = requestId
         root.addError = root.error
         return
       }
       if (!payload.ok) {
+        root.accountAuthState = "error"
+        root.accountAuthRequestId = -1
         root.addErrorRequestId = requestId
         root.addError = payload.error || "could not add the account"
         return
       }
       root.addErrorRequestId = -1
       root.addError = ""
+      root.accountAuthState = "success"
+      root.accountAuthRequestId = -1
       root.revealedPassword = ""
       root.refreshStatus()
       root.sync()
       root.accountAdded(requestId)
+    }
+  }
+
+  // The helper opens the system browser and waits for Google's loopback
+  // callback. This process receives only the final JSON result; credentials
+  // never pass through QML. Five minutes leaves room for account selection
+  // and consent while still returning a lost sign-in to a retryable state.
+  property Timer googleLoginTimeout: Timer {
+    interval: 5 * 60 * 1000
+    onTriggered: {
+      if (!googleLoginProc.running) return
+      googleLoginProc.timedOut = true
+      googleLoginProc.completed = true
+      googleLoginProc.running = false
+      root.addingAccount = false
+      root.accountAuthState = "error"
+      root.accountAuthRequestId = -1
+      root.addErrorRequestId = googleLoginProc.requestId
+      root.addError = "Google sign-in timed out. Start again to reconnect."
+    }
+  }
+
+  property Process googleLoginProc: Process {
+    property int requestId: -1
+    property bool timedOut: false
+    property bool cancelled: false
+    property bool completed: false
+    running: false
+    stdout: StdioCollector { id: googleLoginOut; waitForEnd: true }
+    onStarted: {
+      if (cancelled || completed) {
+        running = false
+        return
+      }
+      root.accountAuthState = "waiting"
+      root.googleLoginTimeout.restart()
+    }
+    onExited: {
+      root.googleLoginTimeout.stop()
+      if (timedOut || cancelled || completed) {
+        timedOut = false
+        cancelled = false
+        completed = false
+        return
+      }
+      root.addingAccount = false
+      // Keep an OAuth protocol failure on the account form, not in the
+      // calendar's general sync-error channel.
+      var payload = null
+      try {
+        payload = JSON.parse(String(googleLoginOut.text || "").trim())
+      } catch (e) { }
+      if (!payload || typeof payload !== "object") {
+        root.failGoogleLogin(requestId, "Google did not report a sign-in result")
+        return
+      }
+      if (!payload.ok) {
+        root.failGoogleLogin(requestId,
+          payload.error || "Google sign-in could not be completed")
+        return
+      }
+      completed = true
+      root.addErrorRequestId = -1
+      root.addError = ""
+      root.accountAuthState = "success"
+      root.accountAuthRequestId = -1
+      root.refreshStatus()
+      root.sync()
+      root.showNotice(Logic.accountResponseNotice(payload))
+      root.accountAdded(requestId)
+    }
+  }
+
+  // The helper owns the desktop file picker and copies a valid Desktop OAuth
+  // client into omarcal's private config directory. Running it as a process
+  // keeps the picker and file validation off the UI thread.
+  property Process googleClientImportProc: Process {
+    running: false
+    stdout: StdioCollector { id: googleClientImportOut; waitForEnd: true }
+    onExited: {
+      root.importingGoogleClient = false
+      var payload = null
+      try {
+        payload = JSON.parse(String(googleClientImportOut.text || "").trim())
+      } catch (e) { }
+      var result = Logic.googleClientImportResult(payload)
+      root.googleClientImportError = result.state === "error" ? result.message : ""
+      root.googleClientImportNotice = result.state === "imported" ? result.message : ""
+      root.googleClientImportFinished(result.state === "imported")
     }
   }
 
@@ -573,6 +780,10 @@ QtObject {
     onExited: {
       root.syncing = false
       root.syncingCalendar = ""
+      if (root.syncQueued) {
+        root.syncQueued = false
+        Qt.callLater(function() { root.sync() })
+      }
       var payload = root.parse(syncOut.text, "the sync did not report back")
       if (!payload) return
       if (!payload.ok) {
@@ -603,13 +814,68 @@ QtObject {
     onExited: {
       var payload = root.parse(statusOut.text, "")
       if (payload && payload.ok) {
-        root.calendars = payload.calendars || []
         root.accounts = payload.accounts || []
-        root.account = payload.account ? payload.account.user : ""
+        var primary = payload.account || root.accounts[0] || null
+        if (primary && root.accounts.length) {
+          for (var i = 0; i < root.accounts.length; i++) {
+            var row = root.accounts[i]
+            if ((primary.id && row.id === primary.id)
+                || (!primary.id && row.user === primary.user
+                    && (!primary.provider || row.provider === primary.provider))) {
+              primary = row
+              break
+            }
+          }
+        }
+        root.accountDetails = primary
+        if (!root.accounts.length && root.accountDetails)
+          root.accounts = [root.accountDetails]
+        var rawCalendars = payload.calendars || []
+        root.calendars = rawCalendars.map(function(calendar) {
+          var owner = String(calendar.accountId || calendar.account || "")
+          var matched = null
+          for (var i = 0; i < root.accounts.length; i++) {
+            var candidate = root.accounts[i]
+            if (String(candidate.id || candidate.user || "") === owner) {
+              matched = candidate
+              break
+            }
+          }
+          // Older status payloads used the email as calendar.account. Accept
+          // that only when it identifies exactly one account; same-address
+          // Google and iCloud accounts must never borrow each other's scope.
+          if (!matched) {
+            var legacyMatches = root.accounts.filter(function(candidate) {
+              return String(candidate.user || candidate.email || "") === owner
+            })
+            if (legacyMatches.length === 1) matched = legacyMatches[0]
+          }
+          var user = matched
+            ? String(matched.user || matched.email || owner) : owner
+          var accountId = matched
+            ? String(matched.id || matched.user || owner) : owner
+          var provider = matched ? Logic.accountProviderName(matched) : ""
+          var label = user
+          if (root.accounts.length > 1) {
+            if (provider) label = provider + " · " + user
+            else if (/^(google|icloud):/i.test(owner))
+              label = owner.toLowerCase().indexOf("google:") === 0
+                ? "Google account" : "iCloud account"
+          }
+          return Object.assign({}, calendar, {
+            accountId: accountId,
+            accountUser: user,
+            accountProvider: provider,
+            accountLabel: label
+          })
+        })
+        root.account = root.accountDetails ? root.accountDetails.user : ""
+        root.accountId = root.accountDetails
+          ? (root.accountDetails.id || root.accountDetails.user || "") : ""
         root.localZone = payload.localZone || ""
         root.pendingCount = payload.pending || 0
         root.pendingProblems = payload.pendingProblems || []
-        root.server = payload.account ? payload.account.server : ""
+        root.server = root.accountDetails ? root.accountDetails.server : ""
         root.settings = Logic.mergePendingSettings(
           payload.settings || ({}), root.settings,
           Logic.statusSettingsNeedOverlay(

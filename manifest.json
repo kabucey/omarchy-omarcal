@@ -5,7 +5,7 @@
   "version": "2.0.0",
   "author": "lancefaul",
   "license": "MIT",
-  "description": "Your iCloud calendar in the bar: month, week and day views, search, and full editing \u2014 repeating events, invitees, attachments, time zones, alerts and travel time, even offline.",
+  "description": "Your iCloud and Google calendars in the bar: month, week and day views, search, recurrence-aware editing, time zones, alerts, and offline caching.",
   "kinds": [
     "service",
     "bar-widget"

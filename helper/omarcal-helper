@@ -29,21 +29,27 @@ from __future__ import annotations
 import argparse
 import base64
 import fcntl
+import hashlib
+import hmac
 import http.client
 import json
 import os
 import re
+import secrets
 import sqlite3
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
+import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
-from urllib.parse import quote, urljoin, urlsplit
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, quote, urlencode, urljoin, urlsplit
 from zoneinfo import ZoneInfo
 from xml.etree import ElementTree as ET
 
@@ -69,10 +75,28 @@ ICLOUD = "https://caldav.icloud.com/"
 # The same account's contacts, over CardDAV. Only ever read, and only once
 # the person has switched contacts on — see `contacts-sync`.
 ICLOUD_CONTACTS = "https://contacts.icloud.com/"
+GOOGLE_CALDAV_BASE = "https://apidata.googleusercontent.com/caldav/v2/"
+GOOGLE_API_HOST = "www.googleapis.com"
+GOOGLE_AUTH_HOST = "accounts.google.com"
+GOOGLE_TOKEN_HOST = "oauth2.googleapis.com"
+GOOGLE_IDENTITY_HOST = "openidconnect.googleapis.com"
+GOOGLE_AUTH_PATH = "/o/oauth2/v2/auth"
+GOOGLE_TOKEN_PATH = "/token"
+GOOGLE_USERINFO_PATH = "/v1/userinfo"
+GOOGLE_CALLBACK_PATH = "/oauth/callback"
+GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar"
+GOOGLE_SCOPES = f"openid email {GOOGLE_CALENDAR_SCOPE}"
+GOOGLE_OAUTH_TIMEOUT = 5 * 60.0
+GOOGLE_RESPONSE_BYTES = 2 * 1024 * 1024
+GOOGLE_CLIENT_MAX_BYTES = 64 * 1024
 
 REQUEST_TIMEOUT = 45.0
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 MULTIGET_BATCH = 64
+# Google limits a sync-collection page to 250 resources and returns a 507 on
+# the collection plus a continuation sync token. This cap still permits very
+# large calendars while bounding a broken server that never finishes paging.
+MAX_SYNC_REPORT_PAGES = 100
 # iCloud tolerates a handful of parallel requests per account comfortably.
 # Higher than this buys nothing and risks throttling.
 SYNC_WORKERS = 4
@@ -200,8 +224,339 @@ def store_password(account: str, password: str) -> None:
     subprocess.run(
         ["secret-tool", "store", "--label", f"omarcal ({account})",
          "schema", KEYRING_SCHEMA, "account", account],
-        input=password, text=True, check=True, timeout=10,
+        input=password, text=True, capture_output=True, check=True, timeout=10,
     )
+
+
+def _google_keyring_args(account_id: str) -> list[str]:
+    return ["schema", KEYRING_SCHEMA, "account", account_id,
+            "provider", "google", "credential", "refresh-token"]
+
+
+def load_google_refresh_token(account_id: str) -> str:
+    try:
+        done = subprocess.run(
+            ["secret-tool", "lookup", *_google_keyring_args(account_id)],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise Failure("keyring", "could not read the Google sign-in from the keyring") from error
+    if done.returncode != 0 or not done.stdout:
+        raise Failure("no-credential", "Google sign-in is missing; connect the account again")
+    return done.stdout.strip("\n")
+
+
+def stored_google_refresh_token(account_id: str) -> str:
+    try:
+        done = subprocess.run(
+            ["secret-tool", "lookup", *_google_keyring_args(account_id)],
+            capture_output=True, text=True, timeout=10,
+        )
+        return done.stdout.strip("\n") if done.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def store_google_refresh_token(account_id: str, refresh_token: str) -> None:
+    try:
+        subprocess.run(
+            ["secret-tool", "store", "--label", "omarcal (Google Calendar)",
+             *_google_keyring_args(account_id)],
+            input=refresh_token, text=True, capture_output=True,
+            check=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise Failure("keyring", "could not store the Google sign-in in the keyring") from error
+
+
+def forget_google_refresh_token(account_id: str) -> None:
+    try:
+        done = subprocess.run(
+            ["secret-tool", "clear", *_google_keyring_args(account_id)],
+            capture_output=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise Failure("keyring", "could not remove the Google sign-in from the keyring") from error
+    if done.returncode != 0:
+        raise Failure("keyring", "could not remove the Google sign-in from the keyring")
+
+
+def _google_client_config_path() -> str:
+    config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(config_home, "omarcal", "google-client.json")
+
+
+def _validate_google_client_config(data: bytes) -> dict:
+    if len(data) > GOOGLE_CLIENT_MAX_BYTES:
+        raise Failure("google-config", "the Google OAuth client file is too large")
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise Failure("google-config", "the Google OAuth client file is not valid JSON") from error
+    client = payload.get("installed") if isinstance(payload, dict) else None
+    if not isinstance(client, dict):
+        raise Failure("google-config", "the Google OAuth JSON must be a Desktop (installed) client")
+    client_id = client.get("client_id")
+    client_secret = client.get("client_secret", "")
+    if (not isinstance(client_id, str) or not client_id.endswith(".apps.googleusercontent.com")
+            or not isinstance(client_secret, str)):
+        raise Failure("google-config", "the Google Desktop OAuth client JSON is incomplete")
+    return {"client_id": client_id, "client_secret": client_secret}
+
+
+def google_client_config() -> dict:
+    """Read a user-supplied Desktop OAuth client; secrets never enter argv or SQLite."""
+    override = os.environ.get("OMARCAL_GOOGLE_CLIENT_FILE", "").strip()
+    path = override or _google_client_config_path()
+    try:
+        with open(path, "rb") as source:
+            data = source.read(GOOGLE_CLIENT_MAX_BYTES + 1)
+    except OSError as error:
+        raise Failure(
+            "google-config",
+            "add a Google Desktop OAuth client JSON file at ~/.config/omarcal/google-client.json",
+        ) from error
+    return _validate_google_client_config(data)
+
+
+def google_https_request(host: str, path: str, method: str = "GET", body: bytes | None = None,
+                         headers: dict | None = None, timeout: float = REQUEST_TIMEOUT,
+                         max_bytes: int = GOOGLE_RESPONSE_BYTES) -> tuple[int, dict, bytes]:
+    """One bounded HTTPS exchange. Redirects are returned, never followed with a token."""
+    allowed_paths = {
+        GOOGLE_API_HOST: path.startswith("/calendar/v3/"),
+        GOOGLE_TOKEN_HOST: path in (GOOGLE_TOKEN_PATH, "/revoke"),
+        GOOGLE_IDENTITY_HOST: path == GOOGLE_USERINFO_PATH,
+        "apidata.googleusercontent.com": path.startswith("/caldav/v2/"),
+    }
+    if host not in allowed_paths or not allowed_paths[host]:
+        raise Failure("google-origin", "Google requested an untrusted server")
+    if not path.startswith("/") or "\\" in path or any(ord(c) < 0x20 for c in path):
+        raise Failure("google-request", "Google request path was invalid")
+    conn = http.client.HTTPSConnection(
+        host, timeout=timeout, context=ssl.create_default_context())
+    try:
+        conn.request(method, path, body=body, headers=headers or {})
+        response = conn.getresponse()
+        data = response.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise Failure("google-response", "Google's response exceeded the size limit")
+        return response.status, {key.lower(): value for key, value in response.getheaders()}, data
+    except (http.client.HTTPException, OSError) as error:
+        raise Failure("google-network", f"Google could not be reached ({type(error).__name__})") from error
+    finally:
+        conn.close()
+
+
+def google_token_exchange(parameters: dict) -> dict:
+    body = urlencode(parameters).encode("ascii")
+    status, _headers, response = google_https_request(
+        GOOGLE_TOKEN_HOST, GOOGLE_TOKEN_PATH, "POST", body,
+        {"Content-Type": "application/x-www-form-urlencoded",
+         "Accept": "application/json"}, timeout=REQUEST_TIMEOUT,
+    )
+    if status != 200:
+        try:
+            error = json.loads(response).get("error", "")
+        except (json.JSONDecodeError, AttributeError):
+            error = ""
+        if error == "invalid_grant":
+            raise Failure("google-auth", "Google sign-in expired or was revoked; connect the account again")
+        raise Failure("google-auth", f"Google token exchange returned HTTP {status}")
+    try:
+        result = json.loads(response)
+    except json.JSONDecodeError as error:
+        raise Failure("google-auth", "Google returned an invalid sign-in response") from error
+    if not isinstance(result, dict) or not result.get("access_token"):
+        raise Failure("google-auth", "Google returned an incomplete sign-in response")
+    return result
+
+
+class GoogleOAuth:
+    """In-memory OAuth access token with a keyring-backed refresh token."""
+
+    def __init__(self, client: dict, refresh_token: str, access_token: str = "",
+                 expires_at: float = 0):
+        self.client_id = client["client_id"]
+        self.client_secret = client.get("client_secret", "")
+        self.refresh_token = refresh_token
+        self._access_token = access_token
+        self._expires_at = float(expires_at)
+        self._lock = threading.Lock()
+
+    @classmethod
+    def for_account(cls, account_id: str) -> "GoogleOAuth":
+        return cls(google_client_config(), load_google_refresh_token(account_id))
+
+    @classmethod
+    def from_authorization(cls, client: dict, response: dict) -> "GoogleOAuth":
+        refresh_token = response.get("refresh_token", "")
+        if not refresh_token:
+            raise Failure("google-auth", "Google did not return offline access; try connecting again")
+        granted = set(str(response.get("scope", "")).split())
+        if granted and GOOGLE_CALENDAR_SCOPE not in granted:
+            raise Failure("google-scope", "Google did not grant calendar access")
+        return cls(client, refresh_token, response["access_token"],
+                   time.time() + max(0, int(response.get("expires_in", 0))))
+
+    def _refresh_locked(self) -> str:
+        fields = {"client_id": self.client_id, "grant_type": "refresh_token",
+                  "refresh_token": self.refresh_token}
+        if self.client_secret:
+            fields["client_secret"] = self.client_secret
+        result = google_token_exchange(fields)
+        self._access_token = result["access_token"]
+        self._expires_at = time.time() + max(0, int(result.get("expires_in", 0)))
+        return self._access_token
+
+    def access_token(self) -> str:
+        with self._lock:
+            if not self._access_token or time.time() >= self._expires_at - 60:
+                return self._refresh_locked()
+            return self._access_token
+
+    def refresh_after_unauthorized(self, rejected_token: str) -> str:
+        with self._lock:
+            # Another calendar worker may already have refreshed the token.
+            if self._access_token and self._access_token != rejected_token:
+                return self._access_token
+            return self._refresh_locked()
+
+    def api_get(self, path: str) -> tuple[int, bytes]:
+        if not path.startswith("/calendar/v3/"):
+            raise Failure("google-origin", "Google API path was not trusted")
+        return self._get_from_host(GOOGLE_API_HOST, path)
+
+    def userinfo(self) -> dict:
+        status, body = self._get_from_host(GOOGLE_IDENTITY_HOST, GOOGLE_USERINFO_PATH)
+        if status != 200:
+            raise Failure("google-identity", f"Google identity check returned HTTP {status}")
+        try:
+            identity = json.loads(body)
+        except json.JSONDecodeError as error:
+            raise Failure("google-identity", "Google returned an invalid identity response") from error
+        if (not isinstance(identity, dict) or not identity.get("sub")
+                or not identity.get("email") or identity.get("email_verified") is not True):
+            raise Failure("google-identity", "Google did not confirm a verified account email")
+        return identity
+
+    def _get_from_host(self, host: str, path: str) -> tuple[int, bytes]:
+        token = self.access_token()
+        for attempt in range(2):
+            status, _headers, body = google_https_request(
+                host, path, headers={"Authorization": f"Bearer {token}",
+                                     "Accept": "application/json"})
+            if status != 401 or attempt:
+                return status, body
+            token = self.refresh_after_unauthorized(token)
+        return status, body
+
+
+class _OAuthCallbackServer(HTTPServer):
+    timeout = 0.25
+    allow_reuse_address = False
+
+    def __init__(self, server_address, state: str):
+        self.expected_state = state
+        self.result = None
+        super().__init__(server_address, _OAuthCallbackHandler)
+
+
+class _OAuthCallbackHandler(BaseHTTPRequestHandler):
+    def log_message(self, _format, *_args):
+        # The callback URL contains a one-use authorization code.
+        pass
+
+    def do_GET(self):
+        if urlsplit(self.path).path != GOOGLE_CALLBACK_PATH:
+            self.send_error(404, "Not found")
+            return
+        query = parse_qs(urlsplit(self.path).query)
+        states = query.get("state", [])
+        if len(states) != 1 or not hmac.compare_digest(states[0], self.server.expected_state):
+            self.send_error(400, "Sign-in state did not match")
+            return
+        errors = query.get("error", [])
+        if errors:
+            self.server.result = {"error": errors[0][:80]}
+        else:
+            codes = query.get("code", [])
+            if len(codes) != 1 or not codes[0] or len(codes[0]) > 4096:
+                self.send_error(400, "Google did not return an authorization code")
+                return
+            self.server.result = {"code": codes[0]}
+        content = (b"<html><title>Omarcal</title><body>Google sign-in is complete. "
+                   b"You can return to Omarcal.</body></html>")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
+
+def google_authorize(email: str, client: dict | None = None) -> tuple[GoogleOAuth, dict]:
+    """Run Google's installed-app flow in the default browser and loopback listener."""
+    client = client or google_client_config()
+    state = secrets.token_urlsafe(32)
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest())\
+        .decode("ascii").rstrip("=")
+    with _OAuthCallbackServer(("127.0.0.1", 0), state) as server:
+        port = server.server_address[1]
+        redirect_uri = f"http://127.0.0.1:{port}{GOOGLE_CALLBACK_PATH}"
+        parameters = {
+            "client_id": client["client_id"], "response_type": "code",
+            "redirect_uri": redirect_uri, "scope": GOOGLE_SCOPES,
+            "access_type": "offline", "prompt": "consent", "state": state,
+            "code_challenge": challenge, "code_challenge_method": "S256",
+        }
+        if email:
+            parameters["login_hint"] = email
+        url = f"https://{GOOGLE_AUTH_HOST}{GOOGLE_AUTH_PATH}?{urlencode(parameters)}"
+        try:
+            opened = webbrowser.open(url, new=1, autoraise=True)
+        except Exception as error:
+            raise Failure("google-browser", "could not open the system browser for Google sign-in") from error
+        if not opened:
+            raise Failure("google-browser", "could not open the system browser for Google sign-in")
+        deadline = time.monotonic() + GOOGLE_OAUTH_TIMEOUT
+        while server.result is None and time.monotonic() < deadline:
+            server.handle_request()
+        result = server.result
+    if not result:
+        raise Failure("google-timeout", "Google sign-in did not finish in time")
+    if result.get("error"):
+        if result["error"] == "access_denied":
+            raise Failure("google-cancelled", "Google sign-in was cancelled")
+        raise Failure("google-auth", "Google did not authorize this sign-in")
+    fields = {"client_id": client["client_id"], "code": result["code"],
+              "code_verifier": verifier, "grant_type": "authorization_code",
+              "redirect_uri": redirect_uri}
+    if client.get("client_secret"):
+        fields["client_secret"] = client["client_secret"]
+    tokens = google_token_exchange(fields)
+    auth = GoogleOAuth.from_authorization(client, tokens)
+    identity = auth.userinfo()
+    return auth, identity
+
+
+def revoke_google_token(refresh_token: str) -> bool:
+    """Revoke the Google grant best-effort after local keyring deletion."""
+    status, _headers, _body = google_https_request(
+        GOOGLE_TOKEN_HOST, "/revoke", "POST",
+        urlencode({"token": refresh_token}).encode("ascii"),
+        {"Content-Type": "application/x-www-form-urlencoded"}, timeout=10,
+    )
+    if status == 200:
+        return True
+    if status == 400:
+        try:
+            result = json.loads(_body)
+        except json.JSONDecodeError:
+            result = {}
+        return result.get("error") == "invalid_token"
+    return False
 
 
 class Failure(Exception):
@@ -224,22 +579,53 @@ class DavSession:
     one dominated the time before this.
     """
 
-    def __init__(self, user: str, password: str, server: str = ICLOUD):
+    def __init__(self, user: str, password: str, server: str = ICLOUD,
+                 provider: str = "", google_auth: GoogleOAuth | None = None):
+        self.provider = provider or provider_for_server(server)
+        self.google_auth = google_auth
+        if self.provider == "google" and self.google_auth is None:
+            raise Failure("no-credential", "Google sign-in is missing; connect the account again")
+        if self.provider == "google" and url_origin(server) != ("apidata.googleusercontent.com", 443):
+            raise Failure("dav-origin", "Google DAV server is outside its trusted origin")
         token = base64.b64encode(f"{user}:{password}".encode()).decode("ascii")
         self.headers = {
-            "Authorization": f"Basic {token}",
             "User-Agent": "omarcal/0.1",
             "Content-Type": "application/xml; charset=utf-8",
         }
+        if self.provider == "google":
+            self.headers["Authorization"] = f"Bearer {self.google_auth.access_token()}"
+        else:
+            self.headers["Authorization"] = f"Basic {token}"
         self._local = threading.local()
         self._context = ssl.create_default_context()
         self._trusted_origin = url_origin(server)
         self._trusted_icloud_service = icloud_dav_service(self._trusted_origin[0])
 
+    def request_headers(self, depth: str = "0") -> tuple[dict, str]:
+        """Return fresh auth headers and the token used for a possible 401 retry."""
+        headers = dict(self.headers, Depth=depth)
+        token = ""
+        if self.provider == "google":
+            token = self.google_auth.access_token()
+            headers["Authorization"] = f"Bearer {token}"
+            self.headers["Authorization"] = headers["Authorization"]
+        return headers, token
+
+    def refresh_after_unauthorized(self, rejected_token: str) -> bool:
+        if self.provider != "google" or not rejected_token:
+            return False
+        token = self.google_auth.refresh_after_unauthorized(rejected_token)
+        self.headers["Authorization"] = f"Bearer {token}"
+        return True
+
     def _validate_url(self, url: str) -> tuple[str, str]:
         host, path = split_url(url)
         origin = url_origin(url)
+        if self.provider == "google" and not path.startswith("/caldav/v2/"):
+            raise Failure("dav-origin", "Google DAV URL is outside its trusted service path")
         if origin != self._trusted_origin:
+            if self.provider == "google":
+                raise Failure("dav-origin", "Google DAV URL is outside its trusted origin")
             # iCloud moves calendar collections from the public endpoint to
             # a per-account DAV shard. Only that documented service family
             # may cross origins, and only on the standard TLS port.
@@ -253,7 +639,8 @@ class DavSession:
         return host, path
 
     def _connection(self, host: str) -> http.client.HTTPSConnection:
-        self._validate_url(f"https://{host}/")
+        service_path = "/caldav/v2/" if self.provider == "google" else "/"
+        self._validate_url(f"https://{host}{service_path}")
         pool = getattr(self._local, "pool", None)
         if pool is None:
             pool = self._local.pool = {}
@@ -275,27 +662,31 @@ class DavSession:
 
     def request(self, method: str, url: str, body: str = "", depth: str = "0") -> tuple[int, bytes]:
         current_url = url
-        headers = dict(self.headers, Depth=depth)
         payload = body.encode("utf-8") if body else None
         for redirect in range(MAX_DAV_REDIRECTS + 1):
             host, path = self._validate_url(current_url)
-            for attempt in (1, 2):
-                conn = self._connection(host)
-                try:
-                    conn.request(method, path, body=payload, headers=headers)
-                    resp = conn.getresponse()
-                    data = resp.read(MAX_RESPONSE_BYTES + 1)
-                    if len(data) > MAX_RESPONSE_BYTES:
+            for auth_attempt in range(2):
+                for attempt in (1, 2):
+                    conn = self._connection(host)
+                    try:
+                        headers, used_token = self.request_headers(depth)
+                        conn.request(method, path, body=payload, headers=headers)
+                        resp = conn.getresponse()
+                        data = resp.read(MAX_RESPONSE_BYTES + 1)
+                        if len(data) > MAX_RESPONSE_BYTES:
+                            self._discard_connection(host, conn)
+                            raise Failure("response-too-large", "DAV response exceeded the size limit")
+                        break
+                    except (http.client.HTTPException, OSError):
+                        # A pooled connection the server already closed fails on
+                        # first use; drop it and retry once on a fresh one.
                         self._discard_connection(host, conn)
-                        raise Failure("response-too-large", "DAV response exceeded the size limit")
-                    location = resp.getheader("Location") if 300 <= resp.status < 400 else None
+                        if attempt == 2:
+                            raise
+                if (resp.status != 401 or auth_attempt or
+                        not self.refresh_after_unauthorized(used_token)):
                     break
-                except (http.client.HTTPException, OSError):
-                    # A pooled connection the server already closed fails on
-                    # first use; drop it and retry once on a fresh one.
-                    self._discard_connection(host, conn)
-                    if attempt == 2:
-                        raise
+            location = resp.getheader("Location") if 300 <= resp.status < 400 else None
             if not (300 <= resp.status < 400) or not location:
                 return resp.status, data
             if redirect == MAX_DAV_REDIRECTS:
@@ -451,15 +842,119 @@ def discover(session: DavSession, server: str = ICLOUD) -> dict:
     return {"principal": principal_url, "home": home_url, "calendars": calendars}
 
 
+def provider_for_server(server: str) -> str:
+    """Classify only known services; arbitrary CalDAV remains Basic-auth."""
+    try:
+        parsed = urlsplit(server)
+        host = (parsed.hostname or "").rstrip(".").lower()
+    except ValueError:
+        return "caldav"
+    if host == "caldav.icloud.com":
+        return "icloud"
+    if host == "apidata.googleusercontent.com" and parsed.path.startswith("/caldav/v2/"):
+        return "google"
+    return "caldav"
+
+
+def account_identity(provider: str, user: str, server: str) -> str:
+    """Normalize provider identities without merging same-named DAV servers."""
+    normalized_user = user.strip().casefold()
+    if provider != "caldav":
+        return normalized_user
+    origin = url_origin(server)
+    parsed = urlsplit(server)
+    host = f"[{origin[0]}]" if ":" in origin[0] else origin[0]
+    base = f"https://{host}:{origin[1]}{parsed.path.rstrip('/')}"
+    return f"{normalized_user}|{base}"
+
+
+def provider_capabilities(provider: str) -> dict:
+    """Features implemented by each server integration, not optimistic UI flags."""
+    return {
+        "contacts": provider == "icloud",
+        "attachments": provider == "icloud",
+        "create": provider != "google",
+        "write": True,
+        "caldav": True,
+    }
+
+
+def google_calendar_list(auth: GoogleOAuth) -> list[dict]:
+    """Read every visible/subscribed calendar, following CalendarList pages."""
+    path = "/calendar/v3/users/me/calendarList?" + urlencode({
+        "maxResults": 250, "showDeleted": "false", "showHidden": "true",
+    })
+    calendars = []
+    pages = 0
+    while path:
+        pages += 1
+        if pages > 100:
+            raise Failure("google-calendar-list", "Google returned too many calendar pages")
+        status, body = auth.api_get(path)
+        if status != 200:
+            raise Failure("google-calendar-list", f"Google calendar list returned HTTP {status}")
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError as error:
+            raise Failure("google-calendar-list", "Google returned an invalid calendar list") from error
+        if not isinstance(payload, dict) or not isinstance(payload.get("items", []), list):
+            raise Failure("google-calendar-list", "Google returned an incomplete calendar list")
+        for item in payload.get("items", []):
+            if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"]:
+                continue
+            calendars.append(item)
+            if len(calendars) > 25000:
+                raise Failure("google-calendar-list", "Google returned too many calendars")
+        next_page = payload.get("nextPageToken")
+        path = ("/calendar/v3/users/me/calendarList?" + urlencode({
+            "maxResults": 250, "showDeleted": "false", "showHidden": "true",
+            "pageToken": next_page,
+        })) if next_page else ""
+    return calendars
+
+
+def discover_google(auth: GoogleOAuth) -> dict:
+    """CalendarList supplies IDs/roles; Google's CalDAV URL is per calendar."""
+    calendars = []
+    primary = ""
+    for item in google_calendar_list(auth):
+        calendar_id = item["id"]
+        if item.get("primary"):
+            primary = calendar_id
+        encoded_id = quote(calendar_id, safe="")
+        url = GOOGLE_CALDAV_BASE + encoded_id + "/events/"
+        role = item.get("accessRole", "")
+        calendars.append({
+            "href": urlsplit(url).path,
+            "url": url,
+            "name": item.get("summaryOverride") or item.get("summary") or calendar_id,
+            "color": str(item.get("backgroundColor") or "")[:7],
+            "ctag": "",
+            # Google CalDAV does not expose DAV current-user-privilege-set.
+            # CalendarList is the provider's authoritative access role.
+            "readonly": role not in ("writer", "owner"),
+            "accessRole": role,
+        })
+    return {
+        "principal": (GOOGLE_CALDAV_BASE + quote(primary, safe="") + "/user") if primary else "",
+        "home": GOOGLE_CALDAV_BASE,
+        "calendars": calendars,
+    }
+
+
 # ---------------------------------------------------------------------- cache
 
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
-    user   TEXT PRIMARY KEY,
+    id     TEXT PRIMARY KEY,
+    user   TEXT NOT NULL,
+    identity TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT 'icloud',
     server TEXT NOT NULL,
     home   TEXT NOT NULL DEFAULT '',
-    added  INTEGER NOT NULL DEFAULT 0
+    added  INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(provider, identity)
 );
 CREATE TABLE IF NOT EXISTS calendars (
     url       TEXT PRIMARY KEY,
@@ -529,6 +1024,47 @@ CREATE TABLE IF NOT EXISTS contact_state (
 """
 
 
+def migrate_accounts(conn) -> None:
+    """Upgrade the prior email-keyed account table without changing its IDs."""
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(accounts)")}
+    if "id" in columns:
+        return
+    if not {"user", "server", "home", "added"}.issubset(columns):
+        raise Failure("database", "the stored account table has an unsupported shape")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "CREATE TABLE accounts_replacement ("
+            "id TEXT PRIMARY KEY, user TEXT NOT NULL, identity TEXT NOT NULL DEFAULT '', "
+            "provider TEXT NOT NULL DEFAULT 'icloud', server TEXT NOT NULL, "
+            "home TEXT NOT NULL DEFAULT '', added INTEGER NOT NULL DEFAULT 0, "
+            "UNIQUE(provider, identity))"
+        )
+        rows = conn.execute("SELECT user,server,home,added FROM accounts").fetchall()
+        identities: set[tuple[str, str]] = set()
+        for user, server, home, added in rows:
+            provider = provider_for_server(server)
+            # The old email value remains the account ID so calendar ownership,
+            # contacts, and pending writes continue to resolve without rewriting.
+            identity = account_identity(provider, user, server)
+            if (provider, identity) in identities:
+                # Older versions allowed case-distinct user strings. Keep every
+                # row and its account ID; new adds will use the normalized key.
+                identity = f"{identity}#legacy-{user}"
+            identities.add((provider, identity))
+            conn.execute(
+                "INSERT INTO accounts_replacement(id,user,identity,provider,server,home,added) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (user, user, identity, provider, server, home, added),
+            )
+        conn.execute("DROP TABLE accounts")
+        conn.execute("ALTER TABLE accounts_replacement RENAME TO accounts")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
 def migrate(conn) -> None:
     """Carry a one-account database into the many-account shape.
 
@@ -538,18 +1074,22 @@ def migrate(conn) -> None:
     """
     tables = {r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
-    if "account" not in tables:
-        return
-    row = conn.execute("SELECT user, server, home FROM account WHERE id=1").fetchone()
+    if "account" in tables:
+        row = conn.execute("SELECT user, server, home FROM account WHERE id=1").fetchone()
+    else:
+        row = None
     if row:
+        provider = provider_for_server(row[1])
+        identity = account_identity(provider, row[0], row[1])
         conn.execute(
-            "INSERT INTO accounts(user,server,home,added) VALUES(?,?,?,?) "
-            "ON CONFLICT(user) DO NOTHING",
-            (row[0], row[1], row[2], int(time.time())),
+            "INSERT INTO accounts(id,user,identity,provider,server,home,added) "
+            "VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING",
+            (row[0], row[0], identity, provider, row[1], row[2], int(time.time())),
         )
         conn.execute("UPDATE calendars SET account=? WHERE account=''", (row[0],))
-    conn.execute("DROP TABLE account")
-    conn.commit()
+    if "account" in tables:
+        conn.execute("DROP TABLE account")
+        conn.commit()
 
 
 def db() -> sqlite3.Connection:
@@ -558,6 +1098,7 @@ def db() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(SCHEMA)
+    migrate_accounts(conn)
     # A column added after the fact; sqlite has no IF NOT EXISTS for one.
     have = {r[1] for r in conn.execute("PRAGMA table_info(calendars)")}
     if "account" not in have:
@@ -595,10 +1136,81 @@ def state_mutation_lock(conn):
 
 
 def accounts_of(conn) -> list[tuple[str, str]]:
-    rows = list(conn.execute("SELECT user, server FROM accounts ORDER BY added, user"))
+    rows = list(conn.execute("SELECT id, server FROM accounts ORDER BY added, user"))
     if not rows:
         raise Failure("no-account", "no account configured; run login first")
     return [(r[0], r[1]) for r in rows]
+
+
+def account_record(conn, account_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT id,user,identity,provider,server,home,added FROM accounts WHERE id=?",
+        (account_id,),
+    ).fetchone()
+    if not row:
+        return None
+    return dict(zip(("id", "user", "identity", "provider", "server", "home", "added"), row))
+
+
+def account_by_identity(conn, provider: str, identity: str) -> dict | None:
+    row = conn.execute(
+        "SELECT id,user,identity,provider,server,home,added FROM accounts "
+        "WHERE provider=? AND identity=? ORDER BY added LIMIT 1",
+        (provider, identity),
+    ).fetchone()
+    if not row:
+        return None
+    return dict(zip(("id", "user", "identity", "provider", "server", "home", "added"), row))
+
+
+def persist_account(conn, account_id: str, user: str, identity: str,
+                    provider: str, server: str, found: dict) -> list[dict]:
+    current = account_record(conn, account_id)
+    if current and (current["provider"] != provider or current["identity"] != identity):
+        raise Failure("account-collision", "that account ID already belongs to another provider identity")
+    calendar_conflicts = []
+    for cal in found.get("calendars", []):
+        owner = conn.execute("SELECT account FROM calendars WHERE url=?", (cal["url"],)).fetchone()
+        if owner and owner[0] and owner[0] != account_id:
+            calendar_conflicts.append({"name": cal["name"], "url": cal["url"]})
+    conn.execute(
+        "INSERT INTO accounts(id,user,identity,provider,server,home,added) "
+        "VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+        "user=excluded.user, identity=excluded.identity, provider=excluded.provider, "
+        "server=excluded.server, home=excluded.home",
+        (account_id, user, identity, provider, server, found.get("home", ""), int(time.time())),
+    )
+    for cal in found.get("calendars", []):
+        conn.execute(
+            "INSERT INTO calendars(url,href,name,color,account,readonly) VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(url) DO UPDATE SET href=excluded.href, name=excluded.name, "
+            "color=excluded.color, readonly=excluded.readonly "
+            "WHERE calendars.account=excluded.account OR calendars.account=''",
+            (cal["url"], cal["href"], cal["name"], cal["color"],
+             account_id, int(cal["readonly"])),
+        )
+    conn.commit()
+    return calendar_conflicts
+
+
+def resolve_account_id(conn, user: str, provider: str = "") -> str:
+    """Resolve the legacy email-style selector only when it is unambiguous."""
+    selector = "(id=? OR user=? OR identity=?)"
+    values: list[str] = [user, user, user.strip().casefold()]
+    where = selector
+    if provider:
+        where += " AND provider=?"
+        values.append(provider)
+    rows = conn.execute(
+        "SELECT id FROM accounts WHERE " + where + " ORDER BY added",
+        values,
+    ).fetchall()
+    ids = list(dict.fromkeys(row[0] for row in rows))
+    if not ids:
+        raise Failure("not-found", f"no account matching {user}")
+    if len(ids) > 1:
+        raise Failure("ambiguous", "more than one account matches; use its account ID")
+    return ids[0]
 
 
 # sqlite does not hand back the pages a delete frees until it is told to.
@@ -676,43 +1288,66 @@ def fetch_calendar(session: DavSession, cal: dict, known: dict[str, str], force:
                 "added": 0, "changed": 0, "removed": 0,
                 "elapsed": round(time.monotonic() - started, 2)}
 
-    token = "" if force else cal.get("cached_token", "")
-    full_sync = not token
-    status, body = session.request("REPORT", cal["url"], sync_report(token), depth="1")
-    if status in (403, 409) and token:
-        # Stale or unsupported sync-token: start over.
-        token = ""
-        full_sync = True
-        status, body = session.request("REPORT", cal["url"], sync_report(""), depth="1")
-    if status not in (200, 207):
-        return {"url": cal["url"], "ok": False, "error": f"HTTP {status}",
-                "elapsed": round(time.monotonic() - started, 2)}
-
-    root = ET.fromstring(body)
+    report_token = "" if force else cal.get("cached_token", "")
+    full_sync = not report_token
+    final_token = report_token
     stale: list[str] = []
+    stale_urls: set[str] = set()
     removed: list[str] = []
     listed: set[str] = set()
-    for resp in root.findall("d:response", NS):
-        href = text_of(resp, "d:href")
-        if not href:
-            raise Failure("sync-response", "sync report returned a resource without an href")
-        url = absolute(cal["url"], href)
-        direct_status = dav_status_code(text_of(resp, "d:status"))
-        collection_root = (url.rstrip("/") == cal["url"].rstrip("/")
-                           or href.rstrip("/") == cal["href"].rstrip("/"))
-        if direct_status == 404 and not collection_root:
-            removed.append(url)
+    seen_tokens: set[str] = set()
+    for _page in range(MAX_SYNC_REPORT_PAGES):
+        status, body = session.request(
+            "REPORT", cal["url"], sync_report(report_token), depth="1")
+        if status in (403, 409) and report_token and not listed:
+            # Stale or unsupported sync-token: start over.
+            report_token = ""
+            final_token = ""
+            full_sync = True
+            seen_tokens.clear()
             continue
-        if collection_root:
-            if direct_status is not None and not 200 <= direct_status < 300:
-                raise Failure("sync-response", "sync report could not read the calendar collection")
-            continue
-        validate_dav_response(resp, "sync report")
-        listed.add(url)
-        # Only pull bodies whose etag moved: what makes a warm sync cheap.
-        # --force ignores the etags so a changed parser can rebuild the index.
-        if force or known.get(url) != text_of(resp, ".//d:getetag"):
-            stale.append(href)
+        if status not in (200, 207):
+            return {"url": cal["url"], "ok": False, "error": f"HTTP {status}",
+                    "elapsed": round(time.monotonic() - started, 2)}
+
+        root = ET.fromstring(body)
+        limited = False
+        for resp in root.findall("d:response", NS):
+            href = text_of(resp, "d:href")
+            if not href:
+                raise Failure("sync-response", "sync report returned a resource without an href")
+            url = absolute(cal["url"], href)
+            direct_status = dav_status_code(text_of(resp, "d:status"))
+            collection_root = (url.rstrip("/") == cal["url"].rstrip("/")
+                               or href.rstrip("/") == cal["href"].rstrip("/"))
+            if direct_status == 404 and not collection_root:
+                removed.append(url)
+                continue
+            if collection_root:
+                if direct_status == 507:
+                    limited = True
+                elif direct_status is not None and not 200 <= direct_status < 300:
+                    raise Failure("sync-response", "sync report could not read the calendar collection")
+                continue
+            validate_dav_response(resp, "sync report")
+            listed.add(url)
+            # Only pull bodies whose etag moved: what makes a warm sync cheap.
+            # --force ignores the etags so a changed parser can rebuild the index.
+            if (force or known.get(url) != text_of(resp, ".//d:getetag")) \
+                    and url not in stale_urls:
+                stale.append(href)
+                stale_urls.add(url)
+
+        next_token = text_of(root, "d:sync-token")
+        final_token = next_token
+        if not limited:
+            break
+        if not next_token or next_token == report_token or next_token in seen_tokens:
+            raise Failure("sync-response", "limited sync report did not provide a continuation token")
+        seen_tokens.add(next_token)
+        report_token = next_token
+    else:
+        raise Failure("sync-response", "calendar returned too many sync report pages")
 
     batches = [stale[i:i + MULTIGET_BATCH] for i in range(0, len(stale), MULTIGET_BATCH)]
     rows: list[tuple] = []
@@ -731,6 +1366,13 @@ def fetch_calendar(session: DavSession, cal: dict, known: dict[str, str], force:
             url = absolute(cal["url"], href)
             if url not in requested or url in received:
                 raise Failure("multiget", "calendar-multiget returned an unexpected resource")
+            # A resource can disappear after sync-collection listed its new
+            # etag and before this batch asks for its body. Google reports the
+            # race as a per-resource 404 inside the successful multistatus.
+            if dav_status_code(text_of(resp, "d:status")) == 404:
+                removed.append(url)
+                received.add(url)
+                continue
             validate_dav_response(resp, "calendar-multiget")
             data = text_of(resp, ".//c:calendar-data")
             etag = text_of(resp, ".//d:getetag")
@@ -753,7 +1395,7 @@ def fetch_calendar(session: DavSession, cal: dict, known: dict[str, str], force:
     added = sum(1 for row in rows if row[0] not in known)
     return {
         "url": cal["url"], "ok": True, "skipped": False,
-        "rows": rows, "removed": removed, "token": text_of(root, "d:sync-token"),
+        "rows": rows, "removed": removed, "token": final_token,
         "added": added, "changed": len(rows) - added, "removedCount": len(removed),
         "elapsed": round(time.monotonic() - started, 2),
     }
@@ -768,13 +1410,17 @@ def sync(conn, only: str = "", force: bool = False) -> dict:
 
     # Each account is discovered and pulled on its own, so one that is down
     # or whose password was revoked does not stop the others.
-    for user, server in accounts_of(conn):
+    for account_id, server in accounts_of(conn):
+        record = account_record(conn, account_id)
+        user = record["user"] if record else account_id
         try:
-            results.extend(sync_account(conn, user, server, only, force))
+            results.extend(sync_account(conn, account_id, server, only, force))
         except Failure as failure:
-            results.append({"account": user, "ok": False, "error": failure.message})
+            results.append({"account": user, "accountId": account_id,
+                            "ok": False, "error": failure.message})
         except Exception as error:
-            results.append({"account": user, "ok": False, "error": str(error)[:200]})
+            results.append({"account": user, "accountId": account_id,
+                            "ok": False, "error": str(error)[:200]})
 
     conn.commit()
     return {
@@ -788,12 +1434,31 @@ def sync(conn, only: str = "", force: bool = False) -> dict:
     }
 
 
+def session_for_account(conn, account_id: str, server: str = "") -> DavSession:
+    record = account_record(conn, account_id)
+    target_server = server or (record["server"] if record else ICLOUD)
+    provider = record["provider"] if record else provider_for_server(target_server)
+    display_user = record["user"] if record else account_id
+    if provider == "google":
+        return DavSession(display_user, "", target_server, provider="google",
+                          google_auth=GoogleOAuth.for_account(account_id))
+    return DavSession(display_user, load_password(account_id), target_server)
+
+
 def sync_account(conn, user: str, server: str, only: str, force: bool) -> list[dict]:
-    session = DavSession(user, load_password(user), server)
-    found = discover(session, server)
+    account_id = user
+    record = account_record(conn, account_id)
+    provider = record["provider"] if record else provider_for_server(server)
+    display_user = record["user"] if record else account_id
+    if provider == "google":
+        session = session_for_account(conn, account_id, server)
+        found = discover_google(session.google_auth)
+    else:
+        session = session_for_account(conn, account_id, server)
+        found = discover(session, server)
     cached = {
-        row[0]: {"ctag": row[1], "token": row[2], "enabled": row[3]}
-        for row in conn.execute("SELECT url, ctag, token, enabled FROM calendars")
+        row[0]: {"ctag": row[1], "token": row[2], "enabled": row[3], "account": row[4]}
+        for row in conn.execute("SELECT url, ctag, token, enabled, account FROM calendars")
     }
 
     targets = []
@@ -801,6 +1466,12 @@ def sync_account(conn, user: str, server: str, only: str, force: bool) -> list[d
         if only and only not in (cal["href"], cal["url"], cal["name"]):
             continue
         state = cached.get(cal["url"], {})
+        owner = state.get("account", "")
+        if owner and owner != account_id:
+            # A shared calendar has one cache key and one credential owner.
+            # Keep the first owner until it is disconnected; never silently
+            # transfer cached events or pending edits to another account.
+            continue
         if state.get("enabled", 1) == 0:
             continue
         cal["cached_ctag"] = state.get("ctag", "")
@@ -827,7 +1498,10 @@ def sync_account(conn, user: str, server: str, only: str, force: bool) -> list[d
             except Exception as error:  # network, XML, anything per-calendar
                 outcome = {"url": cal["url"], "ok": False, "error": str(error)[:200]}
             outcome["name"] = cal["name"]
-            outcome["account"] = user
+            outcome["account"] = display_user
+            outcome["accountId"] = account_id
+            outcome["user"] = display_user
+            outcome["provider"] = provider
             results.append((cal, outcome))
 
     # All writes happen here, on one thread, in one transaction per calendar.
@@ -837,10 +1511,10 @@ def sync_account(conn, user: str, server: str, only: str, force: bool) -> list[d
             "INSERT INTO calendars(url,href,name,color,ctag,token,account,readonly,"
             "synced_at,error) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(url) DO UPDATE SET "
             "href=excluded.href, name=excluded.name, color=excluded.color, "
-            "account=excluded.account, readonly=excluded.readonly, "
-            "synced_at=excluded.synced_at, error=excluded.error",
+            "readonly=excluded.readonly, synced_at=excluded.synced_at, error=excluded.error "
+            "WHERE calendars.account=excluded.account OR calendars.account=''",
             (cal["url"], cal["href"], cal["name"], cal["color"], "",
-             "", user, int(cal["readonly"]), now, outcome.get("error", "")),
+             "", account_id, int(cal["readonly"]), now, outcome.get("error", "")),
         )
         if not outcome.get("ok") or outcome.get("skipped"):
             continue
@@ -1471,17 +2145,22 @@ def search(conn, query: str, limit: int) -> dict:
 
 def status(conn) -> dict:
     accounts = [
-        {"user": r[0], "server": r[1], "provider": r[1]}
-        for r in conn.execute("SELECT user, server FROM accounts ORDER BY added, user")
+        {"id": r[0], "user": r[1], "provider": r[2], "server": r[3],
+         "capabilities": provider_capabilities(r[2])}
+        for r in conn.execute(
+            "SELECT id,user,provider,server FROM accounts ORDER BY added, user")
     ]
     calendars = [
         {"url": r[0], "name": r[1], "color": r[2], "enabled": bool(r[3]),
          "readonly": bool(r[4]), "syncedAt": r[5], "error": r[6], "objects": r[7],
-         "account": r[8]}
+         "account": r[9], "accountId": r[8], "provider": r[10],
+         "capabilities": provider_capabilities(r[10])}
         for r in conn.execute(
             "SELECT c.url, c.name, c.color, c.enabled, c.readonly, c.synced_at, c.error, "
-            "(SELECT COUNT(*) FROM objects o WHERE o.calendar = c.url), c.account "
-            "FROM calendars c ORDER BY c.account, c.name"
+            "(SELECT COUNT(*) FROM objects o WHERE o.calendar = c.url), c.account, "
+            "COALESCE(a.user,c.account), COALESCE(a.provider,'caldav') "
+            "FROM calendars c LEFT JOIN accounts a ON a.id=c.account "
+            "ORDER BY c.account, c.name"
         )
     ]
     return {
@@ -1632,12 +2311,14 @@ def sync_contacts(conn) -> dict:
     if not contacts_enabled(conn):
         raise Failure("contacts-off", "contacts are switched off")
     results = []
-    for user, server in accounts_of(conn):
+    for account_id, server in accounts_of(conn):
+        record = account_record(conn, account_id)
         # Only an iCloud account has an iCloud address book to read.
-        if server.rstrip("/") != ICLOUD.rstrip("/"):
+        if (record["provider"] if record else provider_for_server(server)) != "icloud":
             continue
         error, people = "", []
-        session = DavSession(user, load_password(user), ICLOUD_CONTACTS)
+        user = record["user"] if record else account_id
+        session = DavSession(user, load_password(account_id), ICLOUD_CONTACTS)
         try:
             for book in contact_books(session):
                 people.extend(book_people(session, book))
@@ -1648,17 +2329,18 @@ def sync_contacts(conn) -> dict:
         finally:
             session.close()
         if not error:
-            conn.execute("DELETE FROM contacts WHERE account=?", (user,))
+            conn.execute("DELETE FROM contacts WHERE account=?", (account_id,))
             conn.executemany(
                 "INSERT INTO contacts(account,name,email) VALUES(?,?,?) "
                 "ON CONFLICT(account,email) DO UPDATE SET name=excluded.name",
-                [(user, name, email) for name, email in people])
+                [(account_id, name, email) for name, email in people])
         conn.execute(
             "INSERT INTO contact_state(account,synced_at,error) VALUES(?,?,?) "
             "ON CONFLICT(account) DO UPDATE SET synced_at=excluded.synced_at, "
             "error=excluded.error",
-            (user, int(time.time()), error))
-        results.append({"account": user, "count": len(people), "error": error})
+            (account_id, int(time.time()), error))
+        results.append({"account": user, "accountId": account_id,
+                        "count": len(people), "error": error})
     conn.commit()
     return {"ok": True, "accounts": results, **contact_list(conn)}
 
@@ -2377,7 +3059,7 @@ def plan_delete(ics: str, request: dict, zones: Zones) -> list[dict]:
     return [{"method": "PUT", "url": href, "body": clean(parsed).as_ical_string(), "ifMatch": etag}]
 
 
-CONFLICT_MESSAGE = ("This event changed on iCloud since it was opened — on another "
+CONFLICT_MESSAGE = ("This event changed on the calendar server since it was opened — on another "
                     "device, perhaps. Nothing was saved. Close it and open it again "
                     "to see the latest.")
 
@@ -2393,29 +3075,36 @@ def send(session: DavSession, method: str, url: str, body: bytes | None,
         if not if_match and not creates_only:
             raise Failure("precondition", f"{method} requires If-Match for an existing resource")
 
-    host, path = split_url(url)
-    sent = {"Authorization": session.headers["Authorization"],
-            "User-Agent": session.headers["User-Agent"]}
-    sent.update(headers)
-    for attempt in (1, 2):
-        conn = session._connection(host)
-        try:
-            conn.request(method, path, body=body, headers=sent)
-            resp = conn.getresponse()
-            got = {k.lower(): v for k, v in resp.getheaders()}
-            data = resp.read(MAX_RESPONSE_BYTES + 1)
-            if len(data) > MAX_RESPONSE_BYTES:
-                session._discard_connection(host, conn)
-                raise Failure("response-too-large", "DAV response exceeded the size limit")
-            return resp.status, got, data
-        except (http.client.HTTPException, OSError):
+    host, path = session._validate_url(url)
+    if any(key.lower() in ("authorization", "host") for key in headers):
+        raise Failure("request-header", "DAV writes cannot override transport authentication or host")
+    for auth_attempt in range(2):
+        sent, used_token = session.request_headers()
+        sent = {"Authorization": sent["Authorization"],
+                "User-Agent": sent["User-Agent"]}
+        sent.update(headers)
+        for attempt in (1, 2):
+            conn = session._connection(host)
             try:
-                conn.close()
-            except OSError:
-                pass
-            session._local.pool.pop(host, None)
-            if attempt == 2:
-                raise
+                conn.request(method, path, body=body, headers=sent)
+                resp = conn.getresponse()
+                got = {k.lower(): v for k, v in resp.getheaders()}
+                data = resp.read(MAX_RESPONSE_BYTES + 1)
+                if len(data) > MAX_RESPONSE_BYTES:
+                    session._discard_connection(host, conn)
+                    raise Failure("response-too-large", "DAV response exceeded the size limit")
+                break
+            except (http.client.HTTPException, OSError):
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                session._local.pool.pop(host, None)
+                if attempt == 2:
+                    raise
+        if (resp.status != 401 or auth_attempt or
+                not session.refresh_after_unauthorized(used_token)):
+            return resp.status, got, data
     raise Failure("transport", "unreachable")
 
 
@@ -2476,23 +3165,24 @@ def run_writes(session, ops: list[dict]) -> list[dict]:
         except (OSError, http.client.HTTPException) as error:
             if split:
                 if done:
-                    raise Failure("partial-write", "the replacement series was created, but "
-                                  "iCloud's reply about the original was lost. Sync to check "
+                    raise Failure("partial-write", "the replacement series was created, but the "
+                                  "calendar server's reply about the original was lost. Sync to check "
                                   "whether both copies are present before trying again.") from error
                 raise Failure("partial-write", "the connection dropped while creating the new "
-                              "series; it may have reached iCloud. Sync before retrying.") from error
+                              "series; it may have reached the server. Sync before retrying.") from error
             # Nothing sent yet is a save that can wait; something sent is
             # a plan cut in half, which is said as that.
             if not done:
-                raise Failure("offline", f"iCloud could not be reached ({type(error).__name__})")
+                raise Failure("offline", f"the calendar server could not be reached "
+                                         f"({type(error).__name__})")
             raise Failure("write", "the connection dropped partway through saving; "
-                                   "sync to see what reached iCloud")
+                                   "sync to see what reached the server")
         if status == 412:
             if split and done:
                 if rollback_series_split(session_for, op, done):
-                    raise Failure("conflict", "the original series changed on iCloud; the new "
+                    raise Failure("conflict", "the original series changed on the server; the new "
                                   "series was removed. Sync, reopen, and try again.")
-                raise Failure("partial-write", "the original series changed on iCloud, and the "
+                raise Failure("partial-write", "the original series changed on the server, and the "
                               "new series could not be removed. Sync and review the calendar "
                               "before trying again.")
             raise Failure("conflict", CONFLICT_MESSAGE)
@@ -2502,10 +3192,10 @@ def run_writes(session, ops: list[dict]) -> list[dict]:
             detail = re.sub(r"<[^>]+>", " ", data.decode("utf-8", "replace"))
             detail = re.sub(r"\s+", " ", detail).strip()[:160]
             if split and done:
-                raise Failure("partial-write", "iCloud did not confirm the original series "
+                raise Failure("partial-write", "the calendar server did not confirm the original series "
                               f"change (HTTP {status}); the replacement may remain. Sync and "
                               "review the calendar before trying again.")
-            raise Failure("write", f"iCloud refused the {op['method']} "
+            raise Failure("write", f"the calendar server refused the {op['method']} "
                                    f"(HTTP {status}){': ' + detail if detail else ''}")
         done.append({"method": op["method"], "url": op["url"], "etag": got.get("etag", ""),
                      "uid": op.get("uid", ""), "primary": bool(op.get("primary"))})
@@ -2622,8 +3312,13 @@ def account_for(conn, calendar_url: str) -> str:
 
 
 def account_server(conn, account: str) -> str:
-    row = conn.execute("SELECT server FROM accounts WHERE user=?", (account,)).fetchone()
+    row = conn.execute("SELECT server FROM accounts WHERE id=?", (account,)).fetchone()
     return row[0] if row else ICLOUD
+
+
+def account_provider(conn, account: str) -> str:
+    row = conn.execute("SELECT provider FROM accounts WHERE id=?", (account,)).fetchone()
+    return row[0] if row else provider_for_server(account_server(conn, account))
 
 
 # --------------------------------------------------------------------- queue
@@ -2783,7 +3478,10 @@ def send_event(conn, request: dict, deleting: bool) -> dict:
     zones = Zones(local_zone_name())
     ics = base_of(conn, request)
     calendar = request.get("calendarUrl") or request.get("targetCalendarUrl") or ""
-    user = account_for(conn, calendar)
+    account_id = account_for(conn, calendar)
+    provider = account_provider(conn, account_id)
+    if provider == "google" and (request.get("addFiles") or request.get("removeManaged")):
+        raise Failure("unsupported", "Google Calendar event attachments are not supported yet")
     ops = plan_delete(ics, request, zones) if deleting else plan_save(ics, request, zones)
 
     # What would be sent, and nothing sent: for checking a plan against a
@@ -2792,12 +3490,18 @@ def send_event(conn, request: dict, deleting: bool) -> dict:
         return {"ok": True, "dryRun": True, "ops": [
             {k: v for k, v in op.items()} for op in ops]}
 
+    if provider == "google" and any(op.get("ifNoneMatch") for op in ops):
+        raise Failure(
+            "unsupported",
+            "Google Calendar does not support conditional creation yet; this change was not sent",
+        )
+
     sessions: dict[str, DavSession] = {}
 
     def session_for(url: str) -> DavSession:
-        owner = account_of_url(conn, url) or user
+        owner = account_of_url(conn, url) or account_id
         if owner not in sessions:
-            sessions[owner] = DavSession(owner, load_password(owner), account_server(conn, owner))
+            sessions[owner] = session_for_account(conn, owner)
         return sessions[owner]
 
     try:
@@ -2834,7 +3538,8 @@ def send_event(conn, request: dict, deleting: bool) -> dict:
 # on a GLib loop for the one answer and prints it.
 
 
-def pick_file(timeout_s: int = 600) -> dict:
+def pick_file(timeout_s: int = 600, *, title: str = "Attach a file",
+              json_only: bool = False) -> dict:
     from gi.repository import Gio, GLib
     from urllib.parse import unquote, urlparse
     try:
@@ -2859,10 +3564,13 @@ def pick_file(timeout_s: int = 600) -> dict:
     options = {"handle_token": GLib.Variant("s", token),
                "modal": GLib.Variant("b", True),
                "multiple": GLib.Variant("b", False)}
+    if json_only:
+        options["filters"] = GLib.Variant(
+            "a(sa(us))", [("Google OAuth client JSON", [(0, "*.json")])])
     try:
         bus.call_sync("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
                       "org.freedesktop.portal.FileChooser", "OpenFile",
-                      GLib.Variant("(ssa{sv})", ("", "Attach a file", options)),
+                      GLib.Variant("(ssa{sv})", ("", title, options)),
                       GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, -1, None)
     except Exception as error:
         raise Failure("picker", f"the file picker could not open ({error})")
@@ -2877,6 +3585,47 @@ def pick_file(timeout_s: int = 600) -> dict:
     except OSError:
         size = 0
     return {"ok": True, "picked": True, "path": path, "name": os.path.basename(path), "size": size}
+
+
+def _install_google_client_config(data: bytes) -> str:
+    """Atomically install validated client JSON as a private config file."""
+    path = _google_client_config_path()
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=".google-client-", dir=directory)
+    try:
+        with os.fdopen(descriptor, "wb") as destination:
+            os.fchmod(destination.fileno(), 0o600)
+            destination.write(data)
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+    return path
+
+
+def import_google_client() -> dict:
+    selected = pick_file(title="Select Google Desktop OAuth client JSON", json_only=True)
+    if not selected.get("picked"):
+        return {"ok": True, "imported": False, "cancelled": True}
+    try:
+        with open(selected["path"], "rb") as source:
+            data = source.read(GOOGLE_CLIENT_MAX_BYTES + 1)
+    except (KeyError, OSError, TypeError) as error:
+        raise Failure("google-config", "the selected Google OAuth client file could not be read") from error
+
+    # Validate before creating or replacing the destination, so a bad selection
+    # can never displace an already working client.
+    _validate_google_client_config(data)
+    try:
+        path = _install_google_client_config(data)
+    except OSError as error:
+        raise Failure("google-config", "the Google OAuth client file could not be installed") from error
+    return {"ok": True, "imported": True, "path": path}
 
 
 # --------------------------------------------------------------------- places
@@ -3083,10 +3832,12 @@ def main(argv: list[str]) -> int:
         "calendars", "set-calendar", "forget-calendar", "sync",
         "events", "event", "search", "agenda", "status", "settings", "watch",
         "contacts", "contacts-sync", "contacts-forget", "places-history", "places",
-        "save", "delete", "pick-file", "zones", "flush", "pending-dismiss",
+        "save", "delete", "pick-file", "import-google-client", "zones", "flush", "pending-dismiss",
         "update-check",
     ])
     ap.add_argument("--user", default=os.environ.get("OMARCAL_USER", ""))
+    ap.add_argument("--account-id", default="")
+    ap.add_argument("--provider", choices=["icloud", "google", "caldav"], default="")
     ap.add_argument("--server", default=ICLOUD)
     ap.add_argument("--calendar", default="")
     ap.add_argument("--only", action="append", default=[])
@@ -3128,16 +3879,78 @@ MUTATING_COMMANDS = {
 
 
 def dispatch(conn, args) -> dict:
+    if (args.command == "login"
+            and (getattr(args, "provider", "")
+                 or provider_for_server(getattr(args, "server", ICLOUD))) == "google"):
+        # The browser round-trip can take minutes. Do not hold the process-wide
+        # mutation lock while the person is signing in; take it only after the
+        # OAuth callback and calendar discovery have completed.
+        return _dispatch_google_login(conn, args)
     if args.command in MUTATING_COMMANDS:
         with state_mutation_lock(conn):
             return _dispatch_unlocked(conn, args)
     return _dispatch_unlocked(conn, args)
 
 
+def _dispatch_google_login(conn, args) -> dict:
+    hint = str(args.user or "").strip()
+    client = google_client_config()
+    auth, identity = google_authorize(hint, client)
+    raw_user = identity.get("email") if isinstance(identity, dict) else None
+    user = raw_user.strip() if isinstance(raw_user, str) else ""
+    sub = identity.get("sub") if isinstance(identity, dict) else None
+    if (not user or len(user) > 320 or not isinstance(sub, str)
+            or not re.fullmatch(r"[A-Za-z0-9._-]{1,255}", sub)):
+        raise Failure("google-identity", "Google returned an invalid account identifier")
+    found = discover_google(auth)
+    with state_mutation_lock(conn):
+        existing = account_by_identity(conn, "google", sub)
+        account_id = existing["id"] if existing else f"google:{sub}"
+        previous = stored_google_refresh_token(account_id)
+        store_google_refresh_token(account_id, auth.refresh_token)
+        try:
+            conflicts = persist_account(
+                conn, account_id, user, sub, "google", GOOGLE_CALDAV_BASE, found)
+        except Exception:
+            conn.rollback()
+            try:
+                if previous:
+                    store_google_refresh_token(account_id, previous)
+                else:
+                    forget_google_refresh_token(account_id)
+            except Failure:
+                pass
+            raise
+    result = {"ok": True, "account": user, "accountId": account_id,
+              "provider": "google", "calendars": found["calendars"]}
+    if conflicts:
+        result["calendarConflicts"] = conflicts
+        result["warnings"] = [
+            "Some calendars are already connected through another account and kept their existing owner."
+        ]
+    return result
+
+
 def _dispatch_unlocked(conn, args) -> dict:
     if args.command == "login":
         if not args.user:
             raise Failure("usage", "--user is required")
+        server = getattr(args, "server", ICLOUD)
+        requested_provider = getattr(args, "provider", "") or provider_for_server(server)
+        if requested_provider == "google":
+            raise Failure("usage", "Google login must use the OAuth command path")
+
+        if requested_provider not in ("icloud", "caldav"):
+            raise Failure("provider", "that calendar provider is not supported")
+        inferred = provider_for_server(server)
+        if inferred == "google":
+            raise Failure("provider", "use --provider google to connect a Google account")
+        provider = requested_provider
+        if provider == "icloud" and inferred != "icloud":
+            raise Failure("provider", "iCloud accounts must use the iCloud CalDAV server")
+        identity = account_identity(provider, args.user, server)
+        existing = account_by_identity(conn, provider, identity)
+        account_id = existing["id"] if existing else f"account:{uuid.uuid4().hex}"
         # One line, not to EOF. A caller that writes the password down a pipe
         # it keeps open — which is what a QML Process does, since it has no
         # way to close stdin — would otherwise leave this blocked forever.
@@ -3145,60 +3958,88 @@ def _dispatch_unlocked(conn, args) -> dict:
         # No password given means "use the one already held", so an account
         # can be re-checked or its calendars rediscovered without retyping it.
         if not password:
-            password = stored_password(args.user)
+            password = stored_password(account_id)
         if not password:
             raise Failure("usage", "no password given and none stored")
-        session = DavSession(args.user, password, args.server)
-        found = discover(session, args.server)
+        session = DavSession(args.user.strip(), password, server, provider=provider)
+        try:
+            found = discover(session, server)
+        finally:
+            session.close()
+        previous = stored_password(account_id)
         if not os.environ.get("OMARCAL_PASSWORD"):
-            store_password(args.user, password)
-        conn.execute(
-            "INSERT INTO accounts(user,server,home,added) VALUES(?,?,?,?) "
-            "ON CONFLICT(user) DO UPDATE SET server=excluded.server, home=excluded.home",
-            (args.user, args.server, found["home"], int(time.time())),
-        )
-        for cal in found["calendars"]:
-            conn.execute(
-                "INSERT INTO calendars(url,href,name,color,account,readonly) "
-                "VALUES(?,?,?,?,?,?) ON CONFLICT(url) DO UPDATE SET "
-                "href=excluded.href, name=excluded.name, color=excluded.color, "
-                "account=excluded.account, readonly=excluded.readonly",
-                (cal["url"], cal["href"], cal["name"], cal["color"],
-                 args.user, int(cal["readonly"])),
-            )
-        conn.commit()
-        session.close()
-        return {"ok": True, "account": args.user, "calendars": found["calendars"]}
+            store_password(account_id, password)
+        try:
+            conflicts = persist_account(conn, account_id, args.user.strip(), identity,
+                                        provider, server, found)
+        except Exception:
+            conn.rollback()
+            if not os.environ.get("OMARCAL_PASSWORD"):
+                try:
+                    if previous:
+                        store_password(account_id, previous)
+                    else:
+                        forget_password(account_id)
+                except Failure:
+                    pass
+            raise
+        result = {"ok": True, "account": args.user.strip(), "accountId": account_id,
+                  "provider": provider, "calendars": found["calendars"]}
+        if conflicts:
+            result["calendarConflicts"] = conflicts
+            result["warnings"] = [
+                "Some calendars are already connected through another account and kept their existing owner."
+            ]
+        return result
 
     # Hands the stored password back so the panel can show it. Its own
     # command rather than a field on `status`, so nothing reads a secret by
     # accident.
     if args.command == "reveal-password":
-        if not args.user:
-            raise Failure("usage", "--user is required")
-        password = stored_password(args.user)
+        selector = getattr(args, "account_id", "") or args.user
+        if not selector:
+            raise Failure("usage", "--user or --account-id is required")
+        account_id = resolve_account_id(conn, selector, "icloud")
+        password = stored_password(account_id)
         if not password:
-            raise Failure("no-password", f"no stored password for {args.user}")
+            raise Failure("no-password", "no stored password is held for this account")
         return {"ok": True, "password": password}
 
     if args.command == "accounts":
         return {"ok": True, "accounts": status(conn)["accounts"]}
 
     # Everything this account brought: its calendars, their cached events, its
-    # password. Reclaims the space too — a removed account's events are the
+    # credentials. Reclaims the space too — a removed account's events are the
     # one case where the cache can honestly be made smaller.
     if args.command == "remove-account":
-        if not args.user:
-            raise Failure("usage", "--user is required")
+        selector = getattr(args, "account_id", "") or args.user
+        if not selector:
+            raise Failure("usage", "--user or --account-id is required")
+        account_id = resolve_account_id(conn, selector, getattr(args, "provider", ""))
+        record = account_record(conn, account_id)
+        provider = record["provider"] if record else provider_for_server(account_server(conn, account_id))
         urls = [r[0] for r in conn.execute(
-            "SELECT url FROM calendars WHERE account=?", (args.user,))]
+            "SELECT url FROM calendars WHERE account=?", (account_id,))]
         def belongs_to_account(url: str) -> bool:
             return any(url.startswith(calendar) for calendar in urls)
 
         # Clear the keyring first. If secret-tool cannot do it, leave the
         # account and its cache intact so Disconnect cannot report success
-        # while retaining a usable password.
-        forget_password(args.user)
+        # while retaining a usable credential. Google access is then revoked
+        # best-effort using the in-memory copy; offline disconnect still clears
+        # local access and reports that remote revocation could not be confirmed.
+        warning = ""
+        if provider == "google":
+            refresh_token = stored_google_refresh_token(account_id)
+            forget_google_refresh_token(account_id)
+            if refresh_token:
+                try:
+                    if not revoke_google_token(refresh_token):
+                        warning = "The account was removed locally, but Google did not confirm revocation."
+                except Failure:
+                    warning = "The account was removed locally, but Google could not be reached to revoke access."
+        else:
+            forget_password(account_id)
 
         pending_rows = conn.execute("SELECT id, request, state FROM pending").fetchall()
         queued_ids = {pending_id for pending_id, _text, state in pending_rows
@@ -3254,15 +4095,16 @@ def _dispatch_unlocked(conn, args) -> dict:
             conn.executemany("DELETE FROM pending WHERE id=?", ids)
         for url in urls:
             conn.execute("DELETE FROM objects WHERE calendar=?", (url,))
-        conn.execute("DELETE FROM calendars WHERE account=?", (args.user,))
+        conn.execute("DELETE FROM calendars WHERE account=?", (account_id,))
         # Its contacts go with it: they were only kept to suggest invitees
         # for this account's events.
-        conn.execute("DELETE FROM contacts WHERE account=?", (args.user,))
-        conn.execute("DELETE FROM contact_state WHERE account=?", (args.user,))
-        removed = conn.execute("DELETE FROM accounts WHERE user=?", (args.user,)).rowcount
+        conn.execute("DELETE FROM contacts WHERE account=?", (account_id,))
+        conn.execute("DELETE FROM contact_state WHERE account=?", (account_id,))
+        removed = conn.execute("DELETE FROM accounts WHERE id=?", (account_id,)).rowcount
         conn.commit()
         reclaim(conn)
-        return {"ok": True, "removed": bool(removed), "calendars": len(urls)}
+        return {"ok": True, "removed": bool(removed), "accountId": account_id,
+                "calendars": len(urls), "warning": warning}
 
     # A calendar stays on the server; this stops syncing it and lets go of
     # what was cached for it. Turning it back on syncs it again from scratch.
@@ -3387,6 +4229,9 @@ def _dispatch_unlocked(conn, args) -> dict:
 
     if args.command == "pick-file":
         return pick_file()
+
+    if args.command == "import-google-client":
+        return import_google_client()
 
     if args.command == "places-history":
         return {"ok": True, "places": places_history(conn)}

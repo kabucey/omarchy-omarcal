@@ -16,7 +16,10 @@ executable is not installed. The projection is refreshed when cached calendar
 data changes and covers a rolling 32 days before and after the current time.
 
 It supports iCloud with an app-specific password and Google Calendar through
-OAuth in the system browser. Provider credentials stay in the desktop keyring.
+OAuth in the system browser. Calendars that are only a URL — public iCal
+feeds — are added by their address and fetched as-is: no sign-in, and
+read-only, so nothing but their publisher can change them. Provider
+credentials stay in the desktop keyring.
 
 ## What it does
 
@@ -30,7 +33,8 @@ OAuth in the system browser. Provider credentials stay in the desktop keyring.
   Disturb; delivered alerts are remembered across shell restarts.
 - **Search** across every synced calendar, grouped by day, newest first.
 - **Several accounts**, each with its own calendars, shown or hidden
-  individually and syncable one at a time.
+  individually and syncable one at a time — including a calendar that is
+  nothing more than a public iCal URL.
 - **Create, edit, duplicate and delete events** — title, calendar, all
   day, start and end each with its own time zone, repeat (presets, or a
   custom rule: every N days, weeks, months or years, chosen weekdays, "the

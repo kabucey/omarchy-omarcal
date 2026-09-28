@@ -380,6 +380,15 @@ function layoutTimed(events, dayKey) {
 // it clears the WCAG AA threshold for body text against whatever background
 // it actually lands on.
 
+// The colours a calendar is drawn in keep to one small, chosen set. A feed
+// added on its own takes one the other calendars do not already have (the
+// helper does that on add, helper/PALETTE); the picker offers exactly this
+// list, so the set on screen and the set a feed can be drawn in agree.
+var palette = [
+  "#6b8cff", "#e57b6a", "#ef9ec3", "#6fc7ce", "#f2ce5e", "#87c96b",
+  "#b391f0", "#ffab6b", "#6bc0f5", "#c9a37f", "#d490a8", "#95a8d6"
+]
+
 function parseColor(value) {
   var text = String(value || "").trim()
   var six = /^#([0-9a-fA-F]{6})$/.exec(text)
@@ -493,7 +502,9 @@ var PROVIDER_PRESETS = [
     server: "https://caldav.icloud.com/",
     hint: "Apple needs an app-specific password, from account.apple.com under Sign-In and Security." },
   { name: "Google", key: "google", auth: "oauth", server: "",
-    hint: "Sign in with Google in your browser to connect your calendars." }
+    hint: "Sign in with Google in your browser to connect your calendars." },
+  { name: "Calendar URL", key: "webcal", auth: "url", server: "",
+    hint: "Paste the address of a public iCal calendar. It is fetched as it is served — no sign-in, and read-only." }
 ]
 
 // How to get an app-specific password out of Apple, step by step. Kept here
@@ -571,6 +582,15 @@ function accountHelp(provider) {
   if (providerOption(provider) === "Google")
     return { title: "Google OAuth JSON", meta: "Google Calendar",
       steps: GOOGLE_OAUTH_STEPS }
+  if (providerOption(provider) === "Calendar URL")
+    return { title: "Calendar URL", meta: "an iCal feed, read-only", steps: [
+      { title: "Find the address in your calendar app",
+        text: "Calendar apps offer one under \u201Cadd new calendar from URL\u201D or in a calendar\u2019s sharing or export settings. It usually ends in .ics.",
+        link: "" },
+      { title: "Paste it into the form",
+        text: "Omarcal fetches the address on the same schedule as your other calendars. It is read as served and never changed, so no password is needed.",
+        link: "" }
+    ] }
   return { title: "App-specific password", meta: "iCloud",
     steps: APP_PASSWORD_STEPS }
 }
@@ -597,6 +617,8 @@ function providerOption(account) {
   var value = raw.toLowerCase()
   if (value === "google" || value === "google-calendar") return "Google"
   if (value === "icloud" || value === "apple") return "iCloud"
+  if (value === "calendar url" || value === "webcal" || value === "ical"
+      || value === "webcalendar") return "Calendar URL"
   if (account && typeof account === "object")
     return providerName(account.server || raw)
   return providerName(raw)
@@ -654,6 +676,13 @@ function accountProblem(user, server, password, passwordHeld) {
 
 function accountProblemForProvider(provider, user, server, password, passwordHeld) {
   if (providerOption(provider) === "Google") return ""
+  if (providerOption(provider) === "Calendar URL") {
+    var text = String(user || "").trim()
+    if (!text) return "A calendar URL is needed."
+    if (!/^https?:\/\/[^\s]+\.[^\s]+/i.test(text))
+      return "A calendar URL is needed, starting with https:// and pointing at a calendar."
+    return ""
+  }
   return accountProblem(user, server, password, passwordHeld)
 }
 

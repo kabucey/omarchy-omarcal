@@ -587,10 +587,12 @@ TestCase {
 
   // The visible provider choices identify their corresponding sign-in paths.
   function test_supported_provider_presets_match_their_auth_flows() {
-    compare(Logic.providerPresets(), ["iCloud", "Google"])
+    compare(Logic.providerPresets(), ["iCloud", "Google", "Calendar URL"])
     compare(Logic.presetFor("iCloud").auth, "password")
     compare(Logic.presetFor("Google").auth, "oauth")
+    compare(Logic.presetFor("Calendar URL").auth, "url")
     compare(Logic.providerKey("Google"), "google")
+    compare(Logic.providerKey("Calendar URL"), "webcal")
   }
 
   function test_preset_carries_a_server_and_a_hint() {
@@ -643,6 +645,39 @@ TestCase {
 
   function test_google_setup_does_not_require_a_password() {
     compare(Logic.accountProblemForProvider("Google", "", "", "", false), "")
+
+  // A feed added from its URL is validated like an address, not like an
+  // Apple ID: no server, no password, just the URL itself.
+  function test_webcal_form_validates_only_the_address() {
+    var problem
+    problem = Logic.accountProblemForProvider("Calendar URL", "", "", "", false)
+    compare(problem, "A calendar URL is needed.")
+    problem = Logic.accountProblemForProvider(
+      "Calendar URL", "ical.example.com", "", "", false)
+    verify(problem !== "")
+    problem = Logic.accountProblemForProvider(
+      "Calendar URL", "https://ical.example.com/work.ics", "", "", false)
+    compare(problem, "")
+    problem = Logic.accountProblemForProvider(
+      "Calendar URL", "http://192.168.1.10:8080/feeds/x.ics", "", "", false)
+    compare(problem, "")
+  }
+
+  // The stored provider and the visible option are two names for one thing.
+  function test_webcal_provider_maps_both_ways() {
+    compare(Logic.providerOption("webcal"), "Calendar URL")
+    compare(Logic.providerOption("iCal"), "Calendar URL")
+    // The setup form carries the display name, so it has to map to itself;
+    // an account carries the key, so it has to map to the display name.
+    compare(Logic.providerOption("Calendar URL"), "Calendar URL")
+    compare(Logic.providerOption(
+      { id: "webcal:abc", user: "Example", provider: "webcal", server: "https://x.ics" }),
+      "Calendar URL")
+    compare(Logic.accountProblemForProvider(
+      "Calendar URL", "https://feeds.example.com/public.ics", "", "", false), "")
+    compare(Logic.accountProblemForProvider("Calendar URL", "", "", "", false),
+      "A calendar URL is needed.")
+  }
     compare(Logic.accountProblemForProvider(
       "iCloud", "me@example.com", "https://caldav.icloud.com/", "", false),
       "A password is needed.")

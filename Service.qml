@@ -483,6 +483,27 @@ QtObject {
     loginProc.running = true
   }
 
+  // A feed added from its URL: no credential to hand over, the helper
+  // proves the address serves a calendar and then keeps it on its own.
+  // Shares the login process with the password path — the helper reads the
+  // secret off stdin only when it is a password account — and the same
+  // request-id state, so a failed add lands on the form that asked for it.
+  function addWebcalAccount(url, requestId) {
+    if (addingAccount || loginProc.running || googleLoginProc.running) return
+    addError = ""
+    addErrorRequestId = requestId
+    addingAccount = true
+    accountAuthProvider = "webcal"
+    accountAuthState = "connecting"
+    accountAuthRequestId = requestId
+    loginProc.requestId = requestId
+    loginProc.timedOut = false
+    loginProc.cancelled = false
+    loginProc.secret = ""
+    loginProc.command = [helper, "login", "--provider", "webcal", "--user", url]
+    loginProc.running = true
+  }
+
   function addGoogleAccount(requestId) {
     if (addingAccount || importingGoogleClient || loginProc.running
         || googleLoginProc.running || googleClientImportProc.running) return false
@@ -753,6 +774,30 @@ QtObject {
     stdout: StdioCollector { id: toggleOut; waitForEnd: true }
     onExited: {
       if (root.pendingStates.length) { root.runNextState(); return }
+      root.reload()
+      root.refreshStatus()
+    }
+  }
+
+  // Recolour one calendar. The helper stores the choice, so it survives a
+  // restart and a refetch; the list is updated locally first so the picker
+  // swatch responds immediately rather than after a round trip.
+  function setCalendarColor(url, color) {
+    if (colorProc.running) return
+    var next = []
+    for (var i = 0; i < calendars.length; i++) {
+      var entry = calendars[i]
+      next.push(entry.url === url ? Object.assign({}, entry, { color: color }) : entry)
+    }
+    calendars = next
+    colorProc.command = [helper, "set-calendar", "--calendar", url, "--color", color]
+    colorProc.running = true
+  }
+
+  property Process colorProc: Process {
+    running: false
+    stdout: StdioCollector { id: colorOut; waitForEnd: true }
+    onExited: {
       root.reload()
       root.refreshStatus()
     }

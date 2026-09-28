@@ -682,11 +682,16 @@ Panel {
       ? Logic.calendarsForAccount(service.calendars, setupAccountId, setupUser) : []
 
   // Connecting needs a password actually typed: reconnecting with the stored
-  // one proves nothing the account list does not already show.
-  readonly property bool canConnect: setupProvider === "Google"
-    ? !!service && !service.addingAccount && !service.importingGoogleClient
-    : setupPassword !== "" && Logic.accountProblemForProvider(
-        setupProvider, setupUser, setupPreset.server, setupPassword, false) === ""
+  // one proves nothing the account list does not already show. A feed added
+  // from its URL needs only the address itself.
+  readonly property bool canConnect:
+    setupProvider === "Google"
+      ? !!service && !service.addingAccount && !service.importingGoogleClient
+      : setupProvider === "Calendar URL"
+        ? !!service && !service.addingAccount && Logic.accountProblemForProvider(
+            setupProvider, setupUser, "", "", false) === ""
+        : setupPassword !== "" && Logic.accountProblemForProvider(
+            setupProvider, setupUser, setupPreset.server, setupPassword, false) === ""
 
   readonly property var setupChanges: {
     var out = []
@@ -759,7 +764,8 @@ Panel {
   function chooseProvider(name) {
     if (setupEditing || (service && (service.addingAccount
                                      || service.importingGoogleClient))) return
-    setupProvider = name === "Google" ? "Google" : "iCloud"
+    setupProvider = name === "Google" ? "Google"
+      : name === "Calendar URL" ? "Calendar URL" : "iCloud"
     setupActiveRequestId = -1
     setupChangingPassword = false
     setupPassword = ""
@@ -780,9 +786,14 @@ Panel {
       && service.addingAccount && service.accountAuthRequestId >= 0
     var showGoogleError = service && service.accountAuthProvider === "Google"
       && service.addError && service.addErrorRequestId >= 0
-    setupProvider = attachGoogle || showGoogleError ? "Google" : "iCloud"
+    // An add-from-URL that failed says so on the next opening, the way a
+    // failed Google sign-in does.
+    var showWebcalError = service && service.accountAuthProvider === "webcal"
+      && service.addError && service.addErrorRequestId >= 0
+    setupProvider = attachGoogle || showGoogleError ? "Google"
+      : showWebcalError ? "Calendar URL" : "iCloud"
     setupActiveRequestId = attachGoogle ? service.accountAuthRequestId
-      : showGoogleError ? service.addErrorRequestId : -1
+      : (showGoogleError || showWebcalError) ? service.addErrorRequestId : -1
     setupUser = ""
     setupAccountId = ""
     setupPassword = ""
@@ -811,7 +822,11 @@ Panel {
     setupChangingPassword = false
     setupActiveRequestId = -1
     var selected = account || (service ? service.accountDetails : null)
-    setupUser = selected ? (selected.user || "") : (service ? service.account : "")
+    setupUser = selected
+      ? (Logic.providerOption(selected) === "Calendar URL"
+         ? String(selected.server || "")
+         : (selected.user || ""))
+      : (service ? service.account : "")
     setupAccountId = selected
       ? (selected.id || selected.user || "") : (service ? service.accountId : "")
     setupProvider = selected ? Logic.providerOption(selected) : "iCloud"
@@ -881,6 +896,10 @@ Panel {
         service.addErrorRequestId = setupActiveRequestId
         service.addError = "A previous Google sign-in is still closing. Try again."
       }
+      return
+    }
+    if (setupProvider === "Calendar URL") {
+      service.addWebcalAccount(setupUser.trim(), setupActiveRequestId)
       return
     }
     service.addAccount(setupUser.trim(), setupPreset.server, setupPassword,
@@ -1161,6 +1180,82 @@ Panel {
           dayMenu.close()
           root.startNew()
         }
+      }
+    }
+  }
+
+  // The colours a calendar can be drawn in: the small chosen set omarcal
+  // ships, held here so a feed added on its own is still picked from it —
+  // an infinite swatch would make every feed its own one-off colour. The
+  // helper owns the same list (PALETTE) and a new feed takes a swatch no
+  // other calendar wears. Picked in row coordinates: the popup itself sits
+  // in the panel's, the way the day menu does.
+  component ColorPicker: MenuPopup {
+    id: colorPicker
+    property string calendarUrl: ""
+    property string currentColor: ""
+    focus: true
+    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutsideParent
+    padding: Style.spacing.md
+    readonly property real swatchSize: Style.space(28)
+    readonly property real swatchGap: Style.space(8)
+    readonly property int columns: 6
+    readonly property int rows: Math.max(1, Math.ceil(Logic.palette.length / columns))
+    readonly property real pad: Style.spacing.md
+    readonly property real unit: rows * swatchSize + (rows - 1) * swatchGap
+    width: columns * swatchSize + (columns - 1) * swatchGap + pad * 2 + 2
+    height: unit + pad * 2 + 2
+
+    function openFor(url, current, buttonX, buttonBottom) {
+      calendarUrl = url
+      currentColor = current
+      var px = Math.max(pad, Math.min(buttonX - width / 2,
+                                      keyCatcher.width - width - pad))
+      var py = buttonBottom + pad
+      if (py + height > keyCatcher.height - pad)
+        py = buttonBottom - height - pad
+      x = px
+      y = py
+      open()
+    }
+
+    contentItem: Column {
+      spacing: colorPicker.swatchGap
+      Repeater {
+        model: colorPicker.rows
+        delegate: Row {
+          spacing: colorPicker.swatchGap
+          Repeater {
+            model: Logic.palette.slice(
+              index * colorPicker.columns,
+              (index + 1) * colorPicker.columns)
+            delegate: Rectangle {
+          id: swatch
+          width: colorPicker.swatchSize
+          height: colorPicker.swatchSize
+          radius: Style.space(4)
+          color: modelData
+          // The colour this calendar wears: a rim in the foreground the
+          // way a checked radio carries its mark.
+          readonly property bool active:
+            modelData === colorPicker.currentColor
+          border.width: active ? 2 : 0
+          border.color: active ? root.foreground : "transparent"
+
+          MouseArea {
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: {
+              colorPicker.close()
+              if (root.service) {
+                root.service.setCalendarColor(colorPicker.calendarUrl, modelData)
+              }
+            }
+          }
+        }
+      }
+      }
       }
     }
   }
@@ -1552,7 +1647,7 @@ Panel {
       !!(root.service && root.service.syncingCalendar === entry.url)
     signal toggled()
     signal syncRequested()
-
+    signal colorRequested(real buttonX, real buttonBottom)
     // The calendar's own colour, not the theme accent: on a list where every
     // row is a different calendar, the fill is the quickest way to tell which
     // is which, and it already matches the events on the month. A departure
@@ -1600,9 +1695,35 @@ Panel {
       onClicked: row.syncRequested()
     }
 
+    // Recolour the calendar. The feed and the CalDAV alike: the colour is
+    // ours to pick, and the one beside a row of other calendars is the one
+    // that matters.
+    Button {
+      id: rowColor
+      anchors.right: rowSync.left
+      anchors.rightMargin: Style.space(4)
+      anchors.verticalCenter: parent.verticalCenter
+      width: Style.space(22)
+      height: Style.space(22)
+      iconText: "\uf1fc"
+      iconSize: Style.font.caption
+      horizontalPadding: Style.space(3)
+      verticalPadding: Style.space(1)
+      tooltipText: "Calendar color"
+      foreground: row.foreground
+      fontFamily: row.fontFamily
+      onClicked: {
+        // The picker opens in the panel's coordinates, so take the button's
+        // corner there and let it do the rest.
+        var point = rowColor.mapToItem(keyCatcher, 0, 0)
+        row.colorRequested(point.x + rowColor.width / 2,
+                           point.y + rowColor.height)
+      }
+    }
+
     Row {
       anchors.left: parent.left
-      anchors.right: rowSync.left
+      anchors.right: rowColor.left
       anchors.leftMargin: Style.space(8)
       anchors.rightMargin: Style.space(4)
       anchors.verticalCenter: parent.verticalCenter
@@ -2611,6 +2732,12 @@ Panel {
         else if (key === "t" || key === "T") root.goToday()
       }
 
+      // One colour picker for the sidebar, shared by every calendar row.
+      // It lives here rather than in a row because the rows sit in a
+      // scroller, and its coordinates are keyCatcher's — the space it
+      // positions itself in.
+      ColorPicker { id: colorPicker }
+
       Row {
         id: columns
         spacing: 0
@@ -2799,6 +2926,9 @@ Panel {
                         root.service.setCalendarEnabled(modelData.url, !picked)
                       onSyncRequested: if (root.service)
                         root.service.syncCalendar(modelData.url)
+                      onColorRequested: (buttonX, buttonBottom) =>
+                        colorPicker.openFor(modelData.url, modelData.color,
+                                            buttonX, buttonBottom)
                     }
                   }
 
@@ -3561,6 +3691,65 @@ Panel {
                 font.pixelSize: Style.font.caption
               }
 
+            }
+
+            // A feed needs only its address: no Apple, no browser round trip,
+            // and — because nothing it speaks can say anything back — read-only.
+            Column {
+              width: sidebar.width
+              spacing: Style.space(2)
+              visible: root.setupProvider === "Calendar URL"
+
+              Text {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+                text: root.setupEditing
+                  ? "Connected as \u201C" + root.setupUser + "\u201D. Disconnecting it "
+                    + "below stops fetching it and removes its cached events."
+                  : "Paste the address of a public iCal calendar — the one a "
+                    + "calendar app offers under \u201Cadd calendar from URL\u201D. "
+                    + "Omarcal fetches it as it is served, on the same schedule "
+                    + "as the other calendars. No password, and read-only: it "
+                    + "can show the feed, never change it."
+                color: root.subdued
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Text {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                visible: !root.setupEditing
+                text: "Where do I find a calendar's address?"
+                color: Color.accent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.underline: true
+
+                MouseArea {
+                  anchors.fill: parent
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.openAccountHelp("Calendar URL")
+                }
+              }
+
+              PanelSectionHeader {
+                width: parent.width
+                elide: Text.ElideRight
+                text: "Calendar URL"
+              }
+
+              TextField {
+                width: parent.width
+                height: root.fieldHeight
+                enabled: !root.setupEditing
+                         && !(root.service && root.service.addingAccount)
+                text: root.setupUser
+                foreground: root.foreground
+                onTextChanged: root.setupUser = text
+                onAccepted: root.connectAccount()
+              }
             }
 
             Column {
@@ -6453,7 +6642,10 @@ Panel {
                 && !!root.viewerEvent.readonly
               wrapMode: Text.WordWrap
               textFormat: Text.PlainText
-              text: "This calendar is shared read-only, so its events can\u2019t be changed here."
+              text: "This calendar is read-only, so its events can\u2019t be changed here."
+              // Read-only covers both a feed added from its URL and a CalDAV
+              // calendar shared read-only; both keep their events read-only here
+              // and on the helper side for good measure.
               color: root.subdued
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption

@@ -5,7 +5,7 @@
   "version": "2.0.0",
   "author": "lancefaul",
   "license": "MIT",
-  "description": "Your iCloud and Google calendars in the bar: month, week and day views, search, recurrence-aware editing, time zones, alerts, and offline caching.",
+  "description": "Your iCloud and Google calendars, and calendars added from a public iCal URL: month, week and day views, search, recurrence-aware editing, time zones, alerts, and offline caching.",
   "kinds": [
     "service",
     "bar-widget"

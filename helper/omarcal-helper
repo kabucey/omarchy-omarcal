@@ -35,6 +35,7 @@ import hmac
 import http.client
 import json
 import os
+import random
 import re
 import secrets
 import sqlite3
@@ -44,6 +45,8 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
@@ -874,9 +877,9 @@ def provider_capabilities(provider: str) -> dict:
     return {
         "contacts": provider == "icloud",
         "attachments": provider == "icloud",
-        "create": provider != "google",
-        "write": True,
-        "caldav": True,
+        "create": provider in ("icloud", "caldav"),
+        "write": provider != "webcal",
+        "caldav": provider != "webcal",
     }
 
 
@@ -1243,7 +1246,9 @@ def persist_account(conn, account_id: str, user: str, identity: str,
         conn.execute(
             "INSERT INTO calendars(url,href,name,color,account,readonly) VALUES(?,?,?,?,?,?) "
             "ON CONFLICT(url) DO UPDATE SET href=excluded.href, name=excluded.name, "
-            "color=excluded.color, readonly=excluded.readonly "
+            "color=CASE WHEN excluded.color<>'' THEN excluded.color "
+            "ELSE calendars.color END, "
+            "readonly=excluded.readonly "
             "WHERE calendars.account=excluded.account OR calendars.account=''",
             (cal["url"], cal["href"], cal["name"], cal["color"],
              account_id, int(cal["readonly"])),
@@ -1251,6 +1256,130 @@ def persist_account(conn, account_id: str, user: str, identity: str,
     conn.commit()
     refresh_alert_cache_best_effort(conn)
     return calendar_conflicts
+
+
+# ------------------------------------------------------------- webcal feeds
+#
+# A calendar that is a single URL — the .ics address calendar apps offer
+# under "add calendar from URL". There is no protocol on either side beyond
+# GET: no discovery, no sync token, no credentials. The address serves a
+# calendar and omarcal fetches it as-is, so such an account holds exactly
+# one calendar, it is read-only, and a change is seen only when the fetched
+# bytes change. Everything else — the cache, the window, search, alerts —
+# is the same rows as any other calendar's.
+
+WEBCAL_TIMEOUT = 30.0
+WEBCAL_MAX_BYTES = 8 * 1024 * 1024
+
+# The colours a calendar is drawn in keep to one small, chosen set: a
+# handful of feeds added in a row should look like a family, and a random
+# RGB value would give a colour that fits nothing already on the screen.
+# Each new feed takes one that no other calendar has, so a row of feeds
+# also stays tellable apart.
+# The same list is in Logic.js, where the picker offers it.
+PALETTE = [
+    "#6b8cff",  # indigo
+    "#e57b6a",  # coral
+    "#ef9ec3",  # pink
+    "#6fc7ce",  # teal
+    "#f2ce5e",  # amber
+    "#87c96b",  # green
+    "#b391f0",  # violet
+    "#ffab6b",  # tangerine
+    "#6bc0f5",  # sky
+    "#c9a37f",  # sand
+    "#d490a8",  # mauve
+    "#95a8d6",  # slate
+]
+
+
+def pick_color(conn, avoid_url: str = "") -> str:
+    """A colour from the palette that no other calendar already wears."""
+    used = {row[0] for row in conn.execute(
+        "SELECT DISTINCT color FROM calendars WHERE color<>'' AND url<>?",
+        (avoid_url,))}
+    free = [color for color in PALETTE if color not in used]
+    return random.choice(free or PALETTE)
+
+
+def webcal_url(value: str) -> str:
+    """The address as stored: trimmed, and http(s) with a host to fetch."""
+    url = str(value or "").strip()
+    parsed = urlsplit(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise Failure("usage", "a calendar URL is needed, starting with https://")
+    if any(ord(ch) < 0x20 for ch in url):
+        raise Failure("usage", "the calendar URL cannot contain blanks or line breaks")
+    return url
+
+
+def fetch_webcal(url: str) -> bytes:
+    """One bounded GET. Redirects follow; anything that cannot be read is a
+    Failure carrying what happened, not a crash or a hung process."""
+    request = urllib.request.Request(
+        url, method="GET",
+        headers={"User-Agent": "omarcal (calendar sync)",
+                 "Accept": "text/calendar"})
+    try:
+        with urllib.request.urlopen(request, timeout=WEBCAL_TIMEOUT) as response:
+            body = response.read(WEBCAL_MAX_BYTES + 1)
+    except urllib.error.HTTPError as error:
+        raise Failure("webcal", f"the calendar URL answered HTTP {error.code}") from error
+    except (urllib.error.URLError, OSError, ValueError) as error:
+        reason = getattr(error, "reason", None) or error
+        raise Failure("webcal", f"could not reach the calendar ({reason})") from error
+    if len(body) > WEBCAL_MAX_BYTES:
+        raise Failure("webcal", "the calendar is larger than omarcal will fetch (8 MB)")
+    return body
+
+
+def webcal_feed_name(text: str) -> str:
+    """X-WR-CALNAME is the one place a feed is allowed to name itself.
+    Its presence is the closest a URL comes to saying it belongs to a calendar."""
+    for line in text.splitlines():
+        key, sep, value = line.partition(":")
+        if sep and key.strip().casefold() == "x-wr-calname":
+            name = value.strip()
+            if name:
+                return name
+    return ""
+
+
+def webcal_login(conn, url: str) -> dict:
+    """Prove the address serves a calendar, and keep it with its name.
+    Nothing to store in the keyring: there is no credential by design."""
+    body = fetch_webcal(url)
+    text = body.decode("utf-8", "replace")
+    if "BEGIN:VCALENDAR" not in text.upper():
+        raise Failure("webcal",
+                      "that address does not answer with an iCal calendar")
+    host = (urlsplit(url).hostname or "").lower().split(":")[0]
+    name = webcal_feed_name(text) or host or "Calendar"
+    existing = account_by_identity(conn, "webcal", url)
+    account_id = existing["id"] if existing else f"webcal:{uuid.uuid4().hex}"
+    # A feed has no colour of its own, so this one is ours to choose: keep
+    # the colour already on the row if it has one (a choice made in the
+    # app, or given here the first time), else take a free one from the set.
+    stored = conn.execute(
+        "SELECT color FROM calendars WHERE url=?", (url,)).fetchone()
+    color = stored[0] if stored and stored[0] else pick_color(conn, url)
+    found = {"home": "", "calendars": [{
+        "href": urlsplit(url).path or "/",
+        "url": url, "name": name, "color": color, "ctag": "", "readonly": True,
+    }]}
+    try:
+        conflicts = persist_account(conn, account_id, name, url, "webcal", url, found)
+    except Exception:
+        conn.rollback()
+        raise
+    result = {"ok": True, "account": name, "accountId": account_id,
+              "provider": "webcal", "calendars": found["calendars"]}
+    if conflicts:
+        result["calendarConflicts"] = conflicts
+        result["warnings"] = [
+            "A calendar from that address is already connected through another account."
+        ]
+    return result
 
 
 def resolve_account_id(conn, user: str, provider: str = "") -> str:
@@ -1511,6 +1640,8 @@ def sync_account(conn, user: str, server: str, only: str, force: bool) -> list[d
     record = account_record(conn, account_id)
     provider = record["provider"] if record else provider_for_server(server)
     display_user = record["user"] if record else account_id
+    if provider == "webcal":
+        return sync_webcal(conn, account_id, record, only, force)
     if provider == "google":
         session = session_for_account(conn, account_id, server)
         found = discover_google(session.google_auth)
@@ -1598,6 +1729,120 @@ def sync_account(conn, user: str, server: str, only: str, force: bool) -> list[d
         )
     session.close()
     return [outcome for _, outcome in results]
+
+
+def split_feed_events(parsed) -> list[str]:
+    """Per-event wrappers, one ICALENDAR per VEVENT. Every other row in the
+    cache is one event (CalDAV stores them individually), and every reader
+    assumes it — a season's 200 games in one row would hand expand() one
+    master and silently drop the rest. Each wrapper keeps the timezone
+    blocks the feed defined, because an event's TZID means nothing in a
+    calendar that does not carry the zone."""
+    zones: list[str] = []
+    zone = parsed.get_first_component(ICal.ComponentKind.VTIMEZONE_COMPONENT)
+    while zone is not None:
+        zones.append(zone.as_ical_string())
+        zone = parsed.get_next_component(ICal.ComponentKind.VTIMEZONE_COMPONENT)
+    out = []
+    for comp in vevents(parsed):
+        out.append("\r\n".join(
+            ["BEGIN:VCALENDAR", "VERSION:2.0"] + zones
+            + [comp.as_ical_string(), "END:VCALENDAR"]))
+    return out
+
+
+def sync_webcal(conn, account_id: str, record: dict | None,
+                only: str, force: bool) -> list[dict]:
+    """A feed's whole sync is one bounded fetch; the cache writes are the
+    same shape a CalDAV calendar's are, so nothing downstream special-cases
+    it. The fetch is the change check itself: a feed cannot say "nothing
+    moved", so an unchanged one is still re-fetched and then skipped."""
+    url = (record["server"] if record else "") or account_id
+    name = (record["user"] if record and record["user"] else "") \
+        or ((urlsplit(url).hostname or "").lower().split(":")[0]) or "Calendar"
+    if only and only not in (url, name):
+        return []
+    row = conn.execute("SELECT enabled FROM calendars WHERE url=?", (url,)).fetchone()
+    if row and row[0] == 0:
+        return []
+
+    started = time.monotonic()
+    try:
+        body = fetch_webcal(url)
+    except Exception as error:
+        # Say it on the calendar itself, then let sync() say it too.
+        try:
+            conn.execute("UPDATE calendars SET error=? WHERE url=?", (str(error)[:200], url))
+        except sqlite3.Error:
+            pass
+        raise
+    text = body.decode("utf-8", "replace")
+    digest = hashlib.sha256(body).hexdigest()
+
+    # The digest says only the bytes stopped changing; it cannot say the
+    # layout is new. A row keyed on the bare feed URL is one whole feed in
+    # one object — the old shape — and one event in a reader that expects
+    # one. Rebuild whenever that is still true, regardless of the digest.
+    existing = [row[0] for row in conn.execute(
+        "SELECT url FROM objects WHERE calendar=? ORDER BY url", (url,))]
+    current = existing[0] if existing else ""
+    current_etag = ""
+    if current:
+        current_etag = conn.execute(
+            "SELECT etag FROM objects WHERE url=?", (current,)).fetchone()[0]
+    legacy = url in existing
+    if not force and current_etag == digest and not legacy and existing:
+        outcome = {"url": url, "ok": True, "skipped": True,
+                   "added": 0, "changed": 0, "removedCount": 0,
+                   "elapsed": round(time.monotonic() - started, 2)}
+    else:
+        parsed = parse_ics(text)
+        blobs = split_feed_events(parsed) if parsed is not None else []
+        keys = [f"{url}#{i}" for i in range(len(blobs))]
+        rows = []
+        for key, blob in zip(keys, blobs):
+            first, last, open_ended, summary, uid = index_of(blob)
+            rows.append((key, url, digest, blob, first, last, open_ended,
+                         summary, uid))
+        removed = [key for key in existing if key not in set(keys)]
+        outcome = {"url": url, "ok": True, "skipped": False,
+                   "rows": rows, "removed": removed, "token": digest,
+                   "added": len(rows), "changed": 0,
+                   "removedCount": len(removed),
+                   "elapsed": round(time.monotonic() - started, 2)}
+    outcome["name"] = name
+    outcome["account"] = name
+    outcome["accountId"] = account_id
+    outcome["user"] = name
+    outcome["provider"] = "webcal"
+
+    # One cache write per sync, the same statements a CalDAV calendar gets.
+    # The digest takes the ctag's place, so the next turn can skip the write.
+    # Color is never updated: the feed has none, and a color picked here in
+    # the app is a choice on our side that a refetch must not undo.
+    now = int(time.time())
+    conn.execute(
+        "INSERT INTO calendars(url,href,name,color,ctag,token,account,readonly,"
+        "synced_at,error) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(url) DO UPDATE SET "
+        "href=excluded.href, name=excluded.name, "
+        "readonly=excluded.readonly, synced_at=excluded.synced_at, error=excluded.error "
+        "WHERE calendars.account=excluded.account OR calendars.account=''",
+        (url, urlsplit(url).path or "/", name, pick_color(conn, url), "", "",
+         account_id, 1, now, ""))
+    if not outcome.get("skipped"):
+        if outcome["removed"]:
+            conn.executemany("DELETE FROM objects WHERE url=?", [(u,) for u in outcome["removed"]])
+        if outcome.get("rows"):
+            conn.executemany(
+                "INSERT INTO objects(url,calendar,etag,ics,first_start,last_end,"
+                "open_ended,summary,uid) VALUES(?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(url) DO UPDATE SET etag=excluded.etag, ics=excluded.ics, "
+                "first_start=excluded.first_start, last_end=excluded.last_end, "
+                "open_ended=excluded.open_ended, summary=excluded.summary, uid=excluded.uid",
+                outcome["rows"],
+            )
+    conn.execute("UPDATE calendars SET ctag=?, token='' WHERE url=?", (digest, url))
+    return [outcome]
 
 
 # --------------------------------------------------------------- ical helpers
@@ -3978,6 +4223,28 @@ def account_provider(conn, account: str) -> str:
     return row[0] if row else provider_for_server(account_server(conn, account))
 
 
+def provider_of_calendar(conn, url: str) -> str:
+    """The account's provider for one calendar. The same join the status rows
+    use, so the two never disagree; "" when the calendar is not stored at all."""
+    if not url:
+        return ""
+    row = conn.execute(
+        "SELECT COALESCE(a.provider, 'caldav') FROM calendars c "
+        "LEFT JOIN accounts a ON a.id = c.account WHERE c.url = ? LIMIT 1",
+        (url,)).fetchone()
+    return row[0] if row else ""
+
+
+def calendar_write_error(conn, request: dict) -> str:
+    """Why this change cannot go to its calendars at all, or "". A save's
+    move counts too: the target has to be able to take the event."""
+    for key in ("calendarUrl", "targetCalendarUrl"):
+        if provider_of_calendar(conn, str(request.get(key) or "")) == "webcal":
+            return ("that calendar was added from a URL, so its events can only "
+                    "be changed by whoever publishes it")
+    return ""
+
+
 # --------------------------------------------------------------------- queue
 #
 # A save made while iCloud cannot be reached is kept and shown at once: its
@@ -4120,6 +4387,9 @@ def write_event(conn, request: dict, deleting: bool) -> dict:
     and nothing is waiting; otherwise queued, shown at once, and sent by the
     next sync. Anything already queued goes first, so changes reach iCloud
     in the order they were made."""
+    reason = calendar_write_error(conn, request)
+    if reason:
+        raise Failure("readonly", reason)
     if request.get("dryRun"):
         return send_event(conn, request, deleting)
     if queued_count(conn):
@@ -4140,6 +4410,13 @@ def send_event(conn, request: dict, deleting: bool) -> dict:
     calendar = request.get("calendarUrl") or request.get("targetCalendarUrl") or ""
     account_id = account_for(conn, calendar)
     provider = account_provider(conn, account_id)
+    if provider == "webcal":
+        # A feed has no address to write to; it can only change at its publisher.
+        raise Failure(
+            "readonly",
+            "that calendar was added from a URL, so its events can only be "
+            "changed by whoever publishes it",
+        )
     if provider == "google" and (request.get("addFiles") or request.get("removeManaged")):
         raise Failure("unsupported", "Google Calendar event attachments are not supported yet")
     ops = plan_delete(ics, request, zones) if deleting else plan_save(ics, request, zones)
@@ -4497,7 +4774,7 @@ def main(argv: list[str]) -> int:
     ])
     ap.add_argument("--user", default=os.environ.get("OMARCAL_USER", ""))
     ap.add_argument("--account-id", default="")
-    ap.add_argument("--provider", choices=["icloud", "google", "caldav"], default="")
+    ap.add_argument("--provider", choices=["icloud", "google", "caldav", "webcal"], default="")
     ap.add_argument("--server", default=ICLOUD)
     ap.add_argument("--calendar", default="")
     ap.add_argument("--only", action="append", default=[])
@@ -4597,6 +4874,8 @@ def _dispatch_unlocked(conn, args) -> dict:
             raise Failure("usage", "--user is required")
         server = getattr(args, "server", ICLOUD)
         requested_provider = getattr(args, "provider", "") or provider_for_server(server)
+        if requested_provider == "webcal":
+            return webcal_login(conn, webcal_url(args.user))
         if requested_provider == "google":
             raise Failure("usage", "Google login must use the OAuth command path")
 
@@ -4698,7 +4977,9 @@ def _dispatch_unlocked(conn, args) -> dict:
                         warning = "The account was removed locally, but Google did not confirm revocation."
                 except Failure:
                     warning = "The account was removed locally, but Google could not be reached to revoke access."
-        else:
+        # A feed added from its URL holds no keyring entry by design, so the
+        # clear is a promise it never made and would only fail the removal.
+        elif provider in ("icloud", "caldav"):
             forget_password(account_id)
 
         pending_rows = conn.execute("SELECT id, request, state FROM pending").fetchall()

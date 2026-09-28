@@ -895,6 +895,18 @@ Panel {
   property string viewMode: "Month"
   property bool viewSeeded: false
 
+  // The one-time seed can only run against a live, loaded service. The panel
+  // is built a moment after the shell settles and `bar` is injected in the
+  // Loader's `onLoaded`, which fires *after* this root's `onCompleted` — so
+  // `service` is still null there and can never be reached by a signal that
+  // already fired (`settingsLoaded` is typically true long before the panel
+  // exists). A binding on the state, not on the transition, re-evaluates the
+  // instant `bar` lands: `bar` is notifiable, so this flips to true even when
+  // `settingsLoaded` never changes, and the seed that would otherwise be lost
+  // to the race happens anyway.
+  readonly property bool viewSeedReady: !!(service && service.settingsLoaded)
+  onViewSeedReadyChanged: seedView()
+
   function seedView() {
     if (viewSeeded || !service || !service.settingsLoaded) return
     viewSeeded = true

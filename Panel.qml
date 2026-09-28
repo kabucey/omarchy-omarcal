@@ -33,6 +33,13 @@ Panel {
   property int viewMonth: today.getMonth() + 1     // Logic.js months are 1-based
   property string selectedKey: todayKey
 
+  // The week the Week view is showing, pinned to one of its days. It is
+  // deliberate that this is not `selectedKey`: paging weeks must move the
+  // week being shown without moving the selection, or every week paged into
+  // would show its same weekday selected. Entering the Week view re-pins it
+  // to the selected day, so the two agree from the first page.
+  property string weekAnchor: selectedKey
+
   // Preferences live in the helper's own store, because shell.json belongs to
   // the shell and a plugin cannot write it. Read its optimistic copy even
   // before the first `status`, so a newly chosen setting appears at once.
@@ -484,7 +491,16 @@ Panel {
   readonly property var rows: Logic.monthRows(cells)
   readonly property var events: service ? service.events : []
   readonly property var calendars: service ? service.calendars : []
-  readonly property var buckets: Logic.bucketByDay(events, cells.map(function (c) { return c.key }))
+  // The week row can hold days outside the month the grid shows (and back
+  // again), so buckets are built over the union of what is visible.
+  readonly property var visibleDayKeys: {
+    var keys = cells.map(function (c) { return c.key })
+    if (viewMode === "Week")
+      for (var i = 0; i < weekKeys.length; i++)
+        if (keys.indexOf(weekKeys[i]) === -1) keys.push(weekKeys[i])
+    return keys
+  }
+  readonly property var buckets: Logic.bucketByDay(events, visibleDayKeys)
   readonly property var selected: buckets[selectedKey] || ({ allDay: [], timed: [] })
 
   // Subdued text, lifted to WCAG AA against whatever the theme's popup
@@ -572,7 +588,7 @@ Panel {
     Logic.layoutTimed(selected.timed, selectedKey)
 
   // ------------------------------------------------------------ week view
-  readonly property var weekKeys: Logic.weekDays(selectedKey, weekStartDay)
+  readonly property var weekKeys: Logic.weekDays(weekAnchor, weekStartDay)
   readonly property var weekBars: Logic.allDayBars(events, weekKeys)
   readonly property int weekLanes: Logic.laneCount(weekBars)
   readonly property var weekHead: Logic.weekHeading(weekKeys)
@@ -934,6 +950,11 @@ Panel {
 
   function setView(mode) {
     viewMode = mode
+    // Coming in means the week shown is the selected day's week, whatever
+    // the selection has moved to since the last time this view was open.
+    if (mode === "Week") weekAnchor = selectedKey
+    // The week shown may reach outside the month that is currently loaded.
+    loadWindow()
     // Write immediately, even if the initial status reply is still in flight.
     // Service.setSetting overlays that optimistic choice onto the reply, so a
     // fast first click cannot be replaced by the previously stored view.
@@ -2566,8 +2587,16 @@ Panel {
   function loadWindow() {
     if (!service || !cells.length) return
     // One day of slack each side so an event running into the grid is caught.
-    service.load(Logic.addDays(cells[0].key, -1),
-                 Logic.addDays(cells[cells.length - 1].key, 2))
+    var first = cells[0].key
+    var last = cells[cells.length - 1].key
+    // The week being shown may step outside the month's grid, and its days
+    // need their events too.
+    if (viewMode === "Week")
+      for (var i = 0; i < weekKeys.length; i++) {
+        if (weekKeys[i] < first) first = weekKeys[i]
+        if (weekKeys[i] > last) last = weekKeys[i]
+      }
+    service.load(Logic.addDays(first, -1), Logic.addDays(last, 2))
   }
 
   function stepMonth(delta) {
@@ -2580,8 +2609,9 @@ Panel {
     loadWindow()
   }
 
-  // Days in Day view, months in the others. The arrows, the brackets and the
-  // wheel all go through this so they cannot disagree about what a step is.
+  // Days in Day view, weeks in Week, months in the others. The arrows, the
+  // brackets and the wheel all go through this so they cannot disagree
+  // about what a step is.
   function stepDay(delta) {
     var next = Logic.addDays(selectedKey, delta)
     selectedKey = next
@@ -2593,9 +2623,22 @@ Panel {
     loadWindow()
   }
 
+  // Moves the week the Week view is showing. On purpose it does not touch
+  // `selectedKey`: the selection stays on the day it was picked on rather
+  // than hopping a week alongside the same weekday.
+  function stepWeek(delta) {
+    weekAnchor = Logic.addDays(weekAnchor, delta * 7)
+    var moved = Logic.parseKey(weekAnchor)
+    if (moved.y !== viewYear || moved.m !== viewMonth) {
+      viewYear = moved.y
+      viewMonth = moved.m
+    }
+    loadWindow()
+  }
+
   function stepView(delta) {
     if (viewMode === "Day") stepDay(delta)
-    else if (viewMode === "Week") stepDay(delta * 7)
+    else if (viewMode === "Week") stepWeek(delta)
     else stepMonth(delta)
   }
 
@@ -2604,6 +2647,7 @@ Panel {
     viewYear = today.getFullYear()
     viewMonth = today.getMonth() + 1
     selectedKey = todayKey
+    weekAnchor = todayKey
     loadWindow()
   }
 
@@ -2705,7 +2749,7 @@ Panel {
         // a week of days, four weeks, a year of months.
         if (dy !== 0) {
           if (root.viewMode === "Day") root.stepDay(dy * 7)
-          else if (root.viewMode === "Week") root.stepDay(dy * 28)
+          else if (root.viewMode === "Week") root.stepWeek(dy * 4)
           else root.stepMonth(dy * 12)
         }
       }
@@ -5052,6 +5096,9 @@ Panel {
               Connections {
                 target: root
                 function onSelectedKeyChanged() {
+                  if (root.viewMode === "Week") Qt.callLater(weekRail.toOpeningHour)
+                }
+                function onWeekAnchorChanged() {
                   if (root.viewMode === "Week") Qt.callLater(weekRail.toOpeningHour)
                 }
                 function onViewModeChanged() {

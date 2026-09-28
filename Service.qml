@@ -1016,7 +1016,7 @@ QtObject {
         notificationSender,
         "--app-name", "lancefaul.omarcal",
         "-g", "󰃭",
-        "-u", "normal",
+        "-u", "critical",
         String(item.title || "Calendar event"),
         alertBody(item)
       ])

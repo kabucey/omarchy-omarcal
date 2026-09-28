@@ -3387,6 +3387,24 @@ Panel {
             anchors.topMargin: root.halfRuleGap
             spacing: Style.spacing.md
 
+            // The same way out the settings page gets, sitting above what it
+            // is leaving: the foot keeps no button of its own anymore, so the
+            // only thing it would have held is the back step.
+            Button {
+              width: sidebar.width
+              height: root.controlSize
+              bordered: true
+              iconText: "\uf053"
+              text: "Back to calendars"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: root.cancelSetup()
+            }
+
+            Item { width: 1; height: Math.max(0, root.halfRuleGap - Style.spacing.md * 2) }
+
+            Rule { width: sidebar.width }
+
             // The provider determines the sign-in path below.
             Column {
               width: sidebar.width
@@ -3684,7 +3702,8 @@ Panel {
               visible: root.setupOpen && root.setupProvider === "Google"
                        && !!(root.service && root.service.addingAccount)
               textFormat: Text.PlainText
-              text: "Finish signing in to Google in your browser. You can cancel here."
+              text: "Finish signing in to Google in your browser. "
+                   + "Back to calendars above cancels it."
               color: root.subdued
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -3912,35 +3931,19 @@ Panel {
               onClicked: root.openSetup()
             }
 
-            Row {
+            Button {
               visible: root.setupOpen
               width: sidebar.width
-              spacing: Style.spacing.md
-
-              Button {
-                width: (sidebar.width - Style.spacing.md) / 2
-                height: root.controlSize
-                bordered: true
-                iconText: "\uf00c"
-                text: "Save"
-                // Nothing to save until a switch has been moved.
-                enabled: root.setupChanges.length > 0
-                opacity: enabled ? 1.0 : 0.4
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                onClicked: root.saveSelection()
-              }
-
-              Button {
-                width: (sidebar.width - Style.spacing.md) / 2
-                height: root.controlSize
-                bordered: true
-                iconText: "\uf00d"
-                text: "Cancel"
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                onClicked: root.cancelSetup()
-              }
+              height: root.controlSize
+              bordered: true
+              iconText: "\uf00c"
+              text: "Save"
+              // Nothing to save until a switch has been moved.
+              enabled: root.setupChanges.length > 0
+              opacity: enabled ? 1.0 : 0.4
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: root.saveSelection()
             }
           }
         }

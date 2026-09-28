@@ -4834,7 +4834,7 @@ Panel {
                     radius: Style.cornerRadius > 0 ? Style.cornerRadius : Style.space(3)
                     color: cardFill
                     border.width: 0
-                    z: dayEventMouse.containsMouse ? 10000 : index
+                    z: index
 
                     required property int index
 
@@ -4893,7 +4893,6 @@ Panel {
                     }
 
                     MouseArea {
-                      id: dayEventMouse
                       anchors.fill: parent
                       hoverEnabled: true
                       cursorShape: Qt.PointingHandCursor
@@ -5218,7 +5217,7 @@ Panel {
                                                        : Style.space(3)
                         color: cardFill
                         border.width: 0
-                        z: weekEventMouse.containsMouse ? 10000 : index
+                        z: index
 
                         required property int index
 
@@ -5276,7 +5275,6 @@ Panel {
                         }
 
                         MouseArea {
-                          id: weekEventMouse
                           anchors.fill: parent
                           hoverEnabled: true
                           cursorShape: Qt.PointingHandCursor

@@ -167,10 +167,6 @@ function eventDayKeys(event) {
   return keys
 }
 
-function spansMultipleDays(event) {
-  return eventDayKeys(event).length > 1
-}
-
 // { "2026-09-22": { allDay: [...], timed: [...] } } for the days given.
 //
 // An event is placed on every day it touches, so a multi-day event appears in
@@ -186,9 +182,10 @@ function bucketByDay(events, dayKeys) {
   }
   for (i = 0; i < events.length; i++) {
     var event = events[i]
-    // A multi-day timed event reads as a band, the way Apple's calendar shows
-    // it, rather than as a sliver in every column it crosses.
-    var band = event.allDay || spansMultipleDays(event)
+    // Only an all-day event goes in the all-day line. A timed one stays a
+    // timed entry on every day it touches: its start and end times are what
+    // make it timed, not how many days it runs.
+    var band = !!event.allDay
     var keys = eventDayKeys(event)
     for (var k = 0; k < keys.length; k++) {
       if (!wanted[keys[k]]) continue
@@ -216,7 +213,7 @@ function allDayBars(events, dayKeys) {
   var bars = []
   for (var i = 0; i < events.length; i++) {
     var event = events[i]
-    if (!event.allDay && !spansMultipleDays(event)) continue
+    if (!event.allDay) continue
     var keys = eventDayKeys(event)
     var from = keys[0], to = keys[keys.length - 1]
     if (to < firstKey || from > lastKey) continue

@@ -213,14 +213,17 @@ TestCase {
     compare(buckets["2026-09-23"].allDay.length, 0)
   }
 
-  // A timed event crossing midnight reads as a band, like Apple's calendar.
-  function test_bucket_treats_multi_day_timed_as_a_band() {
+  // A timed event crossing midnight is a timed event on both of its days.
+  // Having times is what keeps it out of the all-day bin, not how long it runs.
+  function test_bucket_keeps_multi_day_timed_out_of_the_all_day_bin() {
     var days = Logic.weekDays("2026-09-22", 0)
     var buckets = Logic.bucketByDay([
       timed("Red eye", "2026-09-22T22:00:00-05:00", "2026-09-23T06:00:00-05:00")
     ], days)
-    compare(buckets["2026-09-22"].allDay.length, 1)
-    compare(buckets["2026-09-22"].timed.length, 0)
+    compare(buckets["2026-09-22"].allDay.length, 0)
+    compare(buckets["2026-09-22"].timed.length, 1)
+    compare(buckets["2026-09-23"].allDay.length, 0)
+    compare(buckets["2026-09-23"].timed.length, 1)
   }
 
   function test_bucket_sorts_timed_by_start() {
@@ -254,6 +257,14 @@ TestCase {
     compare(bars[0].span, 7)
     compare(bars[0].continuesBefore, true)
     compare(bars[0].continuesAfter, true)
+  }
+
+  function test_bars_ignore_timed_events_however_long_they_run() {
+    var days = Logic.weekDays("2026-09-22", 0)
+    var bars = Logic.allDayBars([
+      timed("Red eye", "2026-09-22T22:00:00-05:00", "2026-09-25T06:00:00-05:00")
+    ], days)
+    compare(bars.length, 0)
   }
 
   function test_overlapping_bars_take_separate_lanes() {

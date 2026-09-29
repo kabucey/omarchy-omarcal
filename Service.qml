@@ -145,6 +145,32 @@ QtObject {
     load(from, to)
   }
 
+  // ------------------------------------------------------------- prewarm
+  //
+  // The panel opens on the current month, and it is built before anyone
+  // reaches for it — but its first load still lands on a click if it did
+  // not already, and there is no loading state, so that first open flashes
+  // empty and then fills. The service knows the month it will open on, so
+  // it loads that same window on its own, a moment after `status` hands it
+  // the calendars, so a click finds the months already in memory.
+  //
+  // It warms only while nothing is loaded: a real load owns `events` from
+  // then on, and a background prewarm must never clobber a window the panel
+  // is showing. `load()` skips a window it already has, so an open on that
+  // same month is a no-op rather than a second spawn.
+  function prewarm() {
+    if (!settingsLoaded || eventsProc.running) return
+    if (rangeStart && rangeEnd && events.length) return
+    if (!helper) return
+    var now = new Date()
+    var grid = Logic.monthGrid(
+      now.getFullYear(), now.getMonth() + 1,
+      Number(setting("weekStartDay", 0)) || 0, "")
+    if (!grid.length) return
+    load(Logic.addDays(grid[0].key, -1),
+         Logic.addDays(grid[grid.length - 1].key, 2))
+  }
+
   // Pull from the server, then reload the window. An unchanged ctag makes
   // this nearly free, so it is safe to call on a timer.
   property bool syncQueued: false
@@ -933,6 +959,9 @@ QtObject {
         root.settingsLoaded = true
         if (!root.alertCursor)
           Qt.callLater(function() { root.pollAlerts() })
+        // `status` just handed back the calendars, so the first month can
+        // warm now, in the background, long before anyone reaches for it.
+        root.prewarm()
       }
       if (root.statusRefreshQueued) {
         root.statusRefreshQueued = false
@@ -1286,6 +1315,7 @@ QtObject {
     interval: 2600
     repeat: false
     onTriggered: {
+      root.prewarm()
       root.sync()
       root.loadPlacesHistory()
       if (Logic.updateCheckDue(root.updateCheckedAt, Date.now(), root.updateCheck))

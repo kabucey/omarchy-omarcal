@@ -45,6 +45,7 @@ import sys
 import tempfile
 import threading
 import time
+import weakref
 import urllib.error
 import urllib.request
 import uuid
@@ -1876,19 +1877,44 @@ def parse_ics(ics: str):
     return parsed
 
 
+# One ICal.Timezone per (object, IANA name). A freshly built zone compiles its
+# transition table on first use — about 0.9 ms each — and expand resolves the
+# zone for every DTSTART, DTEND and RECURRENCE-ID, so rebuilding it on every
+# hit dominated the event windows. libical owns the zone while the object is
+# alive; a weak key drops the entry (and the zones) with the object.
+_ZONE_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
 def timezone_named(parsed, name: str):
-    """Build an ICal.Timezone from the VTIMEZONE the object carries for `name`."""
-    comp = parsed.get_first_component(ICal.ComponentKind.VTIMEZONE_COMPONENT)
-    while comp is not None:
-        if property_text(comp, ICal.PropertyKind.TZID_PROPERTY) == name:
-            zone = ICal.Timezone.new()
-            zone.set_component(comp.clone())
-            return zone
-        comp = parsed.get_next_component(ICal.ComponentKind.VTIMEZONE_COMPONENT)
-    try:
-        return ICal.Timezone.get_builtin_timezone(name)
-    except Exception:
-        return None
+    """An ICal.Timezone for `name`, from the VTIMEZONE the object carries.
+
+    Resolved once per object and IANA name, then reused: building a zone from
+    a VTIMEZONE component is cheap, using the first one is not.
+    """
+    zones = _ZONE_CACHE.get(parsed)
+    if zones is None:
+        zones = {}
+        _ZONE_CACHE[parsed] = zones
+    zone = zones.get(name)
+    if zone is None:
+        comp = parsed.get_first_component(ICal.ComponentKind.VTIMEZONE_COMPONENT)
+        while comp is not None:
+            if property_text(comp, ICal.PropertyKind.TZID_PROPERTY) == name:
+                zone = ICal.Timezone.new()
+                zone.set_component(comp.clone())
+                break
+            comp = parsed.get_next_component(ICal.ComponentKind.VTIMEZONE_COMPONENT)
+        if zone is None:
+            try:
+                zone = ICal.Timezone.get_builtin_timezone(name)
+            except Exception:
+                zone = None
+        # Do not cache a failed lookup: an unresolvable name must keep
+        # falling through to the raw instant, and None is a shared sentinel
+        # either way, but a failure can be transient in a way a zone is not.
+        if zone is not None:
+            zones[name] = zone
+    return zone
 
 
 def absolute_time(parsed, moment) -> int | None:

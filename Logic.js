@@ -167,11 +167,21 @@ function eventDayKeys(event) {
   return keys
 }
 
+// When an event is already up in the day it was bucketed on: one that
+// started on an earlier day is running when that day opens, so it counts as
+// top of day — the same claim `layoutTimed` already makes when it draws it.
+function whenUp(event, key) {
+  if (dateKey(event.start) < key) return 0
+  return minutesOfDay(event.start)
+}
+
 // { "2026-09-22": { allDay: [...], timed: [...] } } for the days given.
 //
 // An event is placed on every day it touches, so a multi-day event appears in
-// each cell it crosses. Timed events sort by start, all-day ones by title, to
-// match the order the backend already emits.
+// each cell it crosses. Timed events sort by when they are up on that day —
+// one still running from before starts the day at its top, the way
+// `layoutTimed` draws it — all-day ones by title, to match the order the
+// backend already emits.
 function bucketByDay(events, dayKeys) {
   var buckets = {}
   var wanted = {}
@@ -194,7 +204,7 @@ function bucketByDay(events, dayKeys) {
   }
   for (var key in buckets) {
     buckets[key].timed.sort(function (a, b) {
-      return minutesOfDay(a.start) - minutesOfDay(b.start)
+      return whenUp(a, key) - whenUp(b, key)
     })
   }
   return buckets

@@ -234,6 +234,17 @@ TestCase {
     compare(buckets["2026-09-22"].timed[0].title, "Early")
   }
 
+  // Still running when the day opens, so it is up from the top of that day
+  // and reads before an appointment that starts later in it — the way the
+  // day timeline already draws it at 12 AM.
+  function test_bucket_sorts_a_carrying_event_to_the_top_of_the_next_day() {
+    var buckets = Logic.bucketByDay([
+      timed("Late in the evening", "2026-09-22T22:00:00-05:00", "2026-09-22T23:00:00-05:00"),
+      timed("Carried over", "2026-09-21T22:00:00-05:00", "2026-09-22T01:00:00-05:00")
+    ], ["2026-09-22"])
+    compare(buckets["2026-09-22"].timed[0].title, "Carried over")
+  }
+
   function test_bucket_ignores_events_outside_the_days_asked_for() {
     var buckets = Logic.bucketByDay(
       [allDay("Elsewhere", "2026-01-01", "2026-01-02")], ["2026-09-22"])

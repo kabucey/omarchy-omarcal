@@ -2715,7 +2715,16 @@ Panel {
 
   onOpenedChanged: {
     setCenterHoverRevealSuppressed(opened)
-    if (opened) { today = new Date(); loadWindow() }
+    if (opened) {
+      today = new Date(); loadWindow()
+      // A view holding today, its now line a quarter down the rail; a
+      // view without today keeps the scroll it already has.
+      if (viewMode === "Day") {
+        Qt.callLater(dayRail.toNowLine)
+      } else if (viewMode === "Week") {
+        Qt.callLater(weekRail.toNowLine)
+      }
+    }
     // Dismissing the card drops the form with it, password included. Leaving
     // it staged would reopen on a half-filled form holding a secret.
     else if (!preserveSetupWhileClosed) closeSetup()
@@ -4748,11 +4757,27 @@ Panel {
               // Opens where the day starts rather than at midnight, and
               // follows the day as the arrows walk through it.
               function toOpeningHour() {
+                if (toNowLine()) return
                 var hour = Math.max(root.dayWindow.from,
                                     Logic.openingHour(root.dayBlocks))
                 contentY = Math.min(
                   Math.max(0, contentHeight - height),
                   Logic.hourOffset(hour - root.dayWindow.from, dayView.hourHeight))
+              }
+
+              // A day that is today opens on its now line, kept a quarter of
+              // the way down the rail so the morning already past stays in
+              // view. Any day without a now line — another date, or one in
+              // which it cannot stand — keeps the opening hour instead.
+              function toNowLine() {
+                if (root.selectedKey !== root.todayKey)
+                  return false
+                var minute = root.today.getHours() * 60 + root.today.getMinutes()
+                var y = Logic.nowScrollY(minute, root.dayWindow,
+                                         dayView.hourHeight, height, contentHeight)
+                if (y < 0) return false
+                contentY = y
+                return true
               }
 
               Component.onCompleted: toOpeningHour()
@@ -5079,6 +5104,7 @@ Panel {
               interactive: contentHeight > height
 
               function toOpeningHour() {
+                if (toNowLine()) return
                 var blocks = []
                 for (var i = 0; i < root.weekKeys.length; i++) {
                   var bucket = root.buckets[root.weekKeys[i]] || ({ timed: [] })
@@ -5088,6 +5114,20 @@ Panel {
                 contentY = Math.min(
                   Math.max(0, contentHeight - height),
                   Logic.hourOffset(hour - root.dayWindow.from, weekView.hourHeight))
+              }
+
+              // The same choice the day rail makes: a week holding today
+              // opens on the now line a quarter down, and any other week
+              // opens where its days start.
+              function toNowLine() {
+                if (root.weekKeys.indexOf(root.todayKey) < 0)
+                  return false
+                var minute = root.today.getHours() * 60 + root.today.getMinutes()
+                var y = Logic.nowScrollY(minute, root.dayWindow,
+                                         weekView.hourHeight, height, contentHeight)
+                if (y < 0) return false
+                contentY = y
+                return true
               }
 
               Component.onCompleted: toOpeningHour()

@@ -1286,6 +1286,21 @@ function hourOffset(hour, hourHeight) {
   return Math.max(0, Math.round(hour * hourHeight))
 }
 
+// Where the rail should sit when a view opens on the day being lived in: on
+// the now line, and as close to a quarter of the way down the viewport as
+// the content allows — the room above is the morning already past. A now
+// line that cannot stand a quarter high sits at the top; one near the end
+// of the content sits at the bottom. -1 is a rail that draws no now line
+// at all, so the caller keeps its own opening position.
+function nowScrollY(nowMinute, win, hourHeight, railHeight, contentHeight) {
+  var w = win || WHOLE_DAY
+  if (nowMinute < w.startMinute || nowMinute > w.endMinute) return -1
+  var line = (nowMinute - w.startMinute) * hourHeight / 60
+  var view = Math.max(0, railHeight)
+  var top = line - view / 4
+  return Math.max(0, Math.min(Math.max(0, (contentHeight || 0) - view), top))
+}
+
 // --------------------------------------------------------------- week view
 
 // The two lines of a week's header: the span of days, and the year under it.

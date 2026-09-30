@@ -121,4 +121,32 @@ TestCase {
     compare(Logic.hourOffset(9, 40), 360)
     compare(Logic.hourOffset(-2, 40), 0)
   }
+
+  // A view holding today opens on the now line, kept a quarter of the way
+  // down the rail, so the morning already past is the room above it.
+  function test_now_scroll_sits_a_quarter_down() {
+    // A whole day at 40px/hour is 960 tall; a 400px viewport shows 10 hours.
+    // Now is 12:00, whose line sits at 480.
+    compare(Logic.nowScrollY(12 * 60, Logic.WHOLE_DAY, 40, 400, 960), 480 - 100)
+  }
+
+  function test_now_scroll_clamps_to_the_edges() {
+    // 01:00 stands 40 down: a quarter high is impossible, so the rail opens
+    // at the top rather than above its content.
+    compare(Logic.nowScrollY(60, Logic.WHOLE_DAY, 40, 400, 960), 0)
+    // 23:59 stands near the bottom: the rail opens wherever its content
+    // ends, with the line at the foot of the viewport, not below it.
+    compare(Logic.nowScrollY(23 * 60 + 59, Logic.WHOLE_DAY, 40, 400, 960),
+            960 - 400)
+  }
+
+  function test_now_scroll_respects_the_working_window() {
+    var win = Logic.dayWindow(7, 19)  // 07:00–19:00, twelve hours
+    // 14:30 sits (14:30 − 07:00) = 450 minutes down, so the line is at 300
+    // and the rail opens with a quarter (25) above it.
+    compare(Logic.nowScrollY(14 * 60 + 30, win, 40, 100, 480), 300 - 25)
+    // 06:00 is outside the window: the rail draws no now line at all, so
+    // the caller keeps its own opening position.
+    compare(Logic.nowScrollY(6 * 60, win, 40, 400, 480), -1)
+  }
 }

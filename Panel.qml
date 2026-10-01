@@ -156,6 +156,116 @@ Panel {
     editorOpen = true
   }
 
+  // ------------------------------------------------------ drawing an event
+  //
+  // A drag down an empty stretch of the day or week rail draws the event it
+  // will make, and letting go opens a small form beside it: the fields most
+  // events need, with the whole form one click away. The draft is the
+  // editor's own, so the calendars offered, the alerts and saving all
+  // behave exactly as they do there.
+
+  // While the pointer is down: the day, the minute the drag began at, the
+  // minute it is at now, and whether it has moved far enough to be a drag.
+  property var dragNew: null
+  // The popover is up over the drawn event.
+  property bool quickOpen: false
+  // The drawn block, in keyCatcher's space, for the popover to sit beside.
+  property rect quickAnchor: Qt.rect(0, 0, 0, 0)
+
+  // Not over a form that is already open: that one is asked about first.
+  readonly property bool canDrawEvent: newEventCalendar !== "" && !editorOpen
+
+  // A new event is on the rail from the drag until it is saved or given up
+  // — in the popover, and still once More Options has moved it to the whole
+  // form, so it is never edited out of sight of where it will land.
+  readonly property bool draftOnRail: quickOpen || (editorOpen && creating)
+
+  // What the rail draws as the new event on a day: the drag while it lasts,
+  // then the draft's own times, so the block follows the form's pickers.
+  function drawnSpanOn(dayKey) {
+    if (dragNew)
+      return dragNew.dayKey === dayKey && dragNew.moved
+        ? Logic.dragSpan(dragNew.anchor, dragNew.point, dayWindow) : null
+    return draftOnRail ? Logic.draftSpanOn(draft, dayKey) : null
+  }
+
+  // The colour of the calendar the new event is going to.
+  readonly property color drawnColor: {
+    var url = draftOnRail && draft ? draft.calendarUrl : newEventCalendar
+    var calendar = Logic.calendarOf(calendars, url)
+    return calendar && calendar.color ? calendar.color : Color.accent
+  }
+
+  // A press on the rail. With the popover up it only puts the popover
+  // away, the way a click beside any popover does; false means no drag.
+  function beginDraw(dayKey, minute) {
+    if (quickOpen) { cancelQuickNew(); return false }
+    if (!canDrawEvent) return false
+    dragNew = { dayKey: dayKey, anchor: minute, point: minute, moved: false }
+    return true
+  }
+
+  function moveDraw(minute) {
+    if (!dragNew) return
+    if (dragNew.moved && dragNew.point === minute) return
+    dragNew = { dayKey: dragNew.dayKey, anchor: dragNew.anchor, point: minute, moved: true }
+  }
+
+  // Letting go over `block`, the drawn event on screen. A press that never
+  // became a drag draws nothing and returns false: it was a click.
+  function endDraw(block) {
+    var drag = dragNew
+    if (!drag || !drag.moved) { dragNew = null; return false }
+    var corner = block.mapToItem(keyCatcher, 0, 0)
+    var anchor = Qt.rect(corner.x, corner.y, block.width, block.height)
+    var span = Logic.dragSpan(drag.anchor, drag.point, dayWindow)
+    dragNew = null
+    startQuickNew(drag.dayKey, span.start, span.end, anchor)
+    return true
+  }
+
+  function startQuickNew(dayKey, startMinute, endMinute, anchor) {
+    dayNotice = ""
+    if (viewerOpen) closeEvent()
+    settingsOpen = false
+    searchOpen = false
+    var base = Logic.newEventAt(dayKey, startMinute, endMinute, newEventCalendar)
+    creating = true
+    draftBase = base
+    draft = Logic.editDraft(base, localZone)
+    if (service) service.loadZones()
+    editNotice = ""
+    quickAnchor = anchor
+    quickOpen = true
+  }
+
+  // What stands in the way of adding it. An empty title is not a problem
+  // here: Add names it New Event.
+  readonly property string quickProblem: quickOpen && draft
+    ? Logic.draftProblem(Logic.withField(
+        draft, "title", Logic.singleLine(draft.title) || "New Event"), "") : ""
+
+  // Escape, or a press beside it: the drawn event was never made.
+  function cancelQuickNew() { if (quickOpen) cancelEdit() }
+
+  // An event needs a title to be saved; one drawn and added without
+  // naming it is called what the block was showing.
+  function saveQuickNew() {
+    if (!draft) return
+    if (!Logic.singleLine(draft.title)) setDraft("title", "New Event")
+    requestSave()
+  }
+
+  // The drawn event in the whole form, for anything the popover leaves out.
+  function expandQuickNew() {
+    if (!quickOpen) return
+    quickOpen = false
+    setDaySidebarCollapsed(false)
+    viewerSeed = null
+    viewerOpen = true
+    editorOpen = true
+  }
+
   // True once the viewer holds the event's detail, not only the list row.
   readonly property bool viewerLoaded: !!(viewerEvent && viewerEvent.href)
   // The new event the form holds is a copy of the one that was open.
@@ -190,6 +300,7 @@ Panel {
 
   function cancelEdit() {
     editorOpen = false
+    quickOpen = false
     // A new event has no viewer to go back to: cancelling it is leaving. A
     // copy does — the original is still open behind it.
     if (creating) {
@@ -1201,6 +1312,82 @@ Panel {
           dayMenu.close()
           root.startNew()
         }
+      }
+    }
+  }
+
+  // The event a drag is drawing, on whichever rail it is drawn on: `top` is
+  // where the rail's first hour sits in the parent, `dayKey` the day the
+  // block belongs to. Drawn over everything else on the rail, in the colour
+  // of the calendar it is going to.
+  component DrawnBlock: Rectangle {
+    id: drawn
+    property string dayKey: ""
+    property real hourHeight: root.hourHeight
+    property real railY: 0
+    readonly property var span: root.drawnSpanOn(dayKey)
+    readonly property int firstMinute: span ? Math.max(span.start, root.dayWindow.startMinute) : 0
+    readonly property int lastMinute: span ? Math.min(span.end, root.dayWindow.endMinute) : 0
+    readonly property color cardFill:
+      Logic.opaqueTint(root.drawnColor, Color.popups.background, 0.4)
+    readonly property string cardForeground:
+      Logic.ensureContrast(root.drawnColor, cardFill, 4.5)
+    readonly property string title: root.draftOnRail && root.draft
+      && Logic.singleLine(root.draft.title) ? Logic.singleLine(root.draft.title) : "New Event"
+
+    visible: span !== null && lastMinute > firstMinute
+    y: railY + Math.round((firstMinute - root.dayWindow.startMinute) * hourHeight / 60)
+    height: Math.max(root.slotHeight, Math.round((lastMinute - firstMinute) * hourHeight / 60))
+    radius: Style.cornerRadius > 0 ? Style.cornerRadius : Style.space(3)
+    color: cardFill
+    border.width: 1
+    border.color: root.drawnColor
+    z: 1000
+
+    Rectangle {
+      x: Style.spacing.xxs
+      anchors.top: parent.top
+      anchors.bottom: parent.bottom
+      anchors.topMargin: Style.spacing.xxs
+      anchors.bottomMargin: Style.spacing.xxs
+      width: Style.space(3)
+      radius: width / 2
+      color: root.drawnColor
+    }
+
+    Column {
+      anchors.fill: parent
+      anchors.topMargin: parent.height <= root.captionLine * 1.6 ? 0 : Style.spacing.xs
+      anchors.bottomMargin: anchors.topMargin
+      anchors.leftMargin: Style.spacing.xs + Style.space(5)
+      anchors.rightMargin: Style.spacing.xs
+      spacing: 0
+      clip: true
+
+      readonly property bool showRange: height > root.captionLine * 1.8
+
+      Text {
+        width: parent.width
+        height: parent.showRange ? implicitHeight : parent.height
+        verticalAlignment: Text.AlignVCenter
+        elide: Text.ElideRight
+        textFormat: Text.PlainText
+        text: drawn.title
+        color: drawn.cardForeground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        font.weight: Font.DemiBold
+      }
+
+      Text {
+        visible: parent.showRange
+        width: parent.width
+        elide: Text.ElideRight
+        textFormat: Text.PlainText
+        text: drawn.span ? Logic.spanLabel(drawn.span.start, drawn.span.end, root.timeFormat) : ""
+        color: drawn.cardForeground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
       }
     }
   }
@@ -2766,7 +2953,8 @@ Panel {
       // Escape peels one layer at a time: whatever is over the card goes
       // first, and only a card with nothing over it closes.
       onCloseRequested: {
-        if (root.placeQuery !== "") root.placeQuery = ""
+        if (root.quickOpen) root.cancelQuickNew()
+        else if (root.placeQuery !== "") root.placeQuery = ""
         else if (root.inviteeSuggestions.length > 0 && !root.inviteeDismissed)
           root.inviteeDismissed = true
         else if (root.consentKind !== "") root.consentKind = ""
@@ -2790,6 +2978,192 @@ Panel {
       // scroller, and its coordinates are keyCatcher's — the space it
       // positions itself in.
       ColorPicker { id: colorPicker }
+
+      // The small form a drawn event opens: what it is, which calendar,
+      // when, where, and what reminds you. Everything else is in the whole
+      // form, behind More Options. It sits beside the block it was drawn
+      // as — right, then left, then under or over it — inside the card,
+      // since nothing can be drawn past the card's edge.
+      MenuPopup {
+        id: quickPop
+        width: Style.space(280)
+        padding: Style.spacing.md
+        focus: true
+        closePolicy: Popup.CloseOnEscape
+
+        function place() {
+          var gap = Style.spacing.sm
+          var edge = Style.spacing.md
+          var a = root.quickAnchor
+          var roomX = keyCatcher.width - width - edge
+          var roomY = keyCatcher.height - height - edge
+          var px, py
+          if (a.x + a.width + gap <= roomX) {
+            px = a.x + a.width + gap
+            py = a.y
+          } else if (a.x - gap - width >= edge) {
+            px = a.x - gap - width
+            py = a.y
+          } else {
+            px = a.x + a.width - width
+            py = a.y + a.height + gap <= roomY ? a.y + a.height + gap
+               : a.y - gap - height
+          }
+          x = Math.max(edge, Math.min(roomX, px))
+          y = Math.max(edge, Math.min(roomY, py))
+        }
+
+        Connections {
+          target: root
+          function onQuickOpenChanged() {
+            if (root.quickOpen) quickPop.open()
+            else quickPop.close()
+          }
+        }
+
+        onAboutToShow: place()
+        onOpened: quickTitle.forceActiveFocus()
+        onHeightChanged: if (opened) place()
+        onClosed: root.cancelQuickNew()
+
+        contentItem: Column {
+          id: quickBody
+          spacing: Style.spacing.sm
+          readonly property var d: root.draft || ({})
+          readonly property real half: (width - Style.spacing.sm) / 2
+
+          TextField {
+            id: quickTitle
+            width: parent.width
+            height: root.fieldHeight
+            placeholderText: "New Event"
+            text: quickBody.d.title || ""
+            foreground: root.foreground
+            onTextEdited: root.setDraft("title", text)
+            onAccepted: root.saveQuickNew()
+          }
+
+          Picker {
+            width: parent.width
+            options: root.editCalendars
+            value: quickBody.d.calendarUrl || ""
+            onPicked: function (choice) { root.setDraft("calendarUrl", choice) }
+          }
+
+          Text {
+            width: parent.width
+            topPadding: Style.spacing.xs
+            textFormat: Text.PlainText
+            text: Logic.shortDate(quickBody.d.startDate || "")
+            color: root.subdued
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Row {
+            width: parent.width
+            spacing: Style.spacing.sm
+            TimeField {
+              width: quickBody.half
+              value: quickBody.d.startTime || ""
+              onPicked: function (clock) { root.setDraft("startTime", clock) }
+            }
+            TimeField {
+              width: quickBody.half
+              value: quickBody.d.endTime || ""
+              onPicked: function (clock) { root.setDraft("endTime", clock) }
+            }
+          }
+
+          TextField {
+            width: parent.width
+            height: root.fieldHeight
+            placeholderText: "Add location"
+            text: quickBody.d.location || ""
+            foreground: root.foreground
+            onTextEdited: root.setDraft("location", text)
+            onAccepted: root.saveQuickNew()
+          }
+
+          // Named, because a picker reading "None" on its own says nothing
+          // about what there is none of.
+          Column {
+            width: parent.width
+            topPadding: Style.spacing.xs
+            spacing: Style.space(4)
+
+            FormLabel { text: "Alert" }
+
+            Picker {
+              width: parent.width
+              options: root.draft ? Logic.alertChoices(root.draft, 0) : []
+              value: quickBody.d.alerts ? quickBody.d.alerts[0] : "none"
+              onPicked: function (choice) { root.setAlert(0, choice) }
+            }
+
+            // A second alert only once there is a first, as in the full form.
+            FormLabel {
+              visible: secondAlert.visible
+              text: "Second alert"
+            }
+
+            Picker {
+              id: secondAlert
+              visible: !!quickBody.d.alerts
+                && (quickBody.d.alerts[0] !== "none" || quickBody.d.alerts[1] !== "none")
+              width: parent.width
+              options: root.draft ? Logic.alertChoices(root.draft, 1) : []
+              value: quickBody.d.alerts ? quickBody.d.alerts[1] : "none"
+              onPicked: function (choice) { root.setAlert(1, choice) }
+            }
+          }
+
+          // Why it cannot be added, or what went wrong when it was tried.
+          Text {
+            readonly property string said: root.editNotice !== "" ? root.editNotice
+              : root.quickProblem
+            visible: said !== ""
+            width: parent.width
+            wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
+            text: said
+            color: root.editNotice !== "" && !root.editNoticeBad ? root.subdued : root.danger
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Item { width: 1; height: Style.spacing.xs }
+
+          Row {
+            width: parent.width
+            spacing: Style.spacing.sm
+
+            Button {
+              width: quickBody.half
+              height: root.controlSize
+              bordered: true
+              text: "More Options\u2026"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: root.expandQuickNew()
+            }
+
+            Button {
+              width: quickBody.half
+              height: root.controlSize
+              bordered: true
+              iconText: "\uf00c"
+              text: root.service && root.service.writing ? "Adding\u2026" : "Add"
+              enabled: !(root.service && root.service.writing)
+                && root.quickProblem === ""
+              opacity: enabled ? 1.0 : 0.4
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: root.saveQuickNew()
+            }
+          }
+        }
+      }
 
       Row {
         id: columns
@@ -4864,6 +5238,37 @@ Panel {
                   }
                 }
 
+                // The empty rail under the events: a drag down it draws a
+                // new one. Declared before the events so they still take
+                // their own clicks.
+                MouseArea {
+                  id: dayDraw
+                  x: root.hourGutter
+                  y: root.railTop
+                  width: railBody.width - root.hourGutter
+                  height: dayView.hourHeight * root.dayWindow.hours
+                  // A drag here draws; it does not scroll the rail.
+                  preventStealing: true
+                  property real pressY: 0
+
+                  function minuteAt(y) {
+                    return Logic.dragMinute(y, dayView.hourHeight, root.dayWindow)
+                  }
+
+                  onPressed: function (mouse) {
+                    pressY = mouse.y
+                    root.beginDraw(root.selectedKey, minuteAt(mouse.y))
+                  }
+                  onPositionChanged: function (mouse) {
+                    if (!root.dragNew) return
+                    if (!root.dragNew.moved
+                        && Math.abs(mouse.y - pressY) < Qt.styleHints.startDragDistance) return
+                    root.moveDraw(minuteAt(mouse.y))
+                  }
+                  onReleased: root.endDraw(dayDrawn)
+                  onCanceled: root.dragNew = null
+                }
+
                 Repeater {
                   model: root.dayBlocks
 
@@ -4954,6 +5359,15 @@ Panel {
                       onClicked: root.openEvent(modelData.event)
                     }
                   }
+                }
+
+                DrawnBlock {
+                  id: dayDrawn
+                  dayKey: root.selectedKey
+                  hourHeight: dayView.hourHeight
+                  railY: root.railTop
+                  x: root.hourGutter + root.slotGap
+                  width: railBody.width - root.hourGutter - root.slotGap * 2
                 }
 
                 // Now, as a line across the rail — only on the day it is,
@@ -5250,15 +5664,42 @@ Panel {
 
                     DayMenu { id: weekColumnMenu }
 
+                    // A click picks the day; a drag down it draws a new
+                    // event there instead, and does not scroll the rail.
                     MouseArea {
                       anchors.fill: parent
                       acceptedButtons: Qt.LeftButton | Qt.RightButton
                       cursorShape: Qt.PointingHandCursor
-                      onClicked: function (mouse) {
+                      preventStealing: true
+                      property real pressY: 0
+                      // Set when this press put the popover away, so its
+                      // click does not also pick the day.
+                      property bool dismissed: false
+
+                      function minuteAt(y) {
+                        return Logic.dragMinute(y, weekView.hourHeight, root.dayWindow)
+                      }
+
+                      onPressed: function (mouse) {
+                        pressY = mouse.y
+                        dismissed = root.quickOpen
+                        if (mouse.button === Qt.LeftButton)
+                          root.beginDraw(weekDay.modelData, minuteAt(mouse.y))
+                        else root.cancelQuickNew()
+                      }
+                      onPositionChanged: function (mouse) {
+                        if (!root.dragNew) return
+                        if (!root.dragNew.moved
+                            && Math.abs(mouse.y - pressY) < Qt.styleHints.startDragDistance) return
+                        root.moveDraw(minuteAt(mouse.y))
+                      }
+                      onReleased: function (mouse) {
+                        if (root.endDraw(weekDrawn) || dismissed) return
                         root.selectedKey = weekDay.modelData
                         if (mouse.button === Qt.RightButton)
                           weekColumnMenu.openFor(weekDay.modelData, mouse.x, mouse.y)
                       }
+                      onCanceled: root.dragNew = null
                     }
 
                     Repeater {
@@ -5351,6 +5792,14 @@ Panel {
                           onClicked: root.openEvent(modelData.event)
                         }
                       }
+                    }
+
+                    DrawnBlock {
+                      id: weekDrawn
+                      dayKey: weekDay.modelData
+                      hourHeight: weekView.hourHeight
+                      x: 2
+                      width: weekDay.width - 4
                     }
                   }
                 }

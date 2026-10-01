@@ -2412,6 +2412,67 @@ function newEvent(dayKey, todayKey, nowClock, calendarUrl) {
   }
 }
 
+// ------------------------------------------------------ drawing a new event
+//
+// A drag down an empty stretch of the day or week rail draws the event it
+// will make. The pointer is read in quarter hours, the way the time pickers
+// count, and kept inside the hours the rail draws.
+
+var DRAG_STEP = 15
+
+// The minute of the day under `y`, a distance down the rail's hours, on the
+// quarter hour nearest it.
+function dragMinute(y, hourHeight, window) {
+  var from = window ? window.startMinute : 0
+  var to = window ? window.endMinute : DAY_MINUTES
+  var raw = from + (Number(y) || 0) * 60 / Math.max(1, hourHeight)
+  var snapped = Math.round(raw / DRAG_STEP) * DRAG_STEP
+  return Math.max(from, Math.min(to, snapped))
+}
+
+// The span between where the drag began and where the pointer is, either
+// way up, and never shorter than a quarter hour — a span drawn upwards from
+// the end of the day still has room above it.
+function dragSpan(anchorMinute, pointMinute, window) {
+  var to = window ? window.endMinute : DAY_MINUTES
+  var start = Math.min(anchorMinute, pointMinute)
+  var end = Math.max(anchorMinute, pointMinute)
+  if (end - start < DRAG_STEP) {
+    end = start + DRAG_STEP
+    if (end > to) { end = to; start = to - DRAG_STEP }
+  }
+  return { start: start, end: end }
+}
+
+// A blank event over a drawn span. An end at 24:00 is midnight of the next
+// day, which is how the rail's last rule reads.
+function newEventAt(dayKey, startMinute, endMinute, calendarUrl) {
+  var base = newEvent(dayKey, "", "", calendarUrl)
+  var endDay = endMinute >= DAY_MINUTES ? addDays(dayKey, 1) : dayKey
+  base.start = dayKey + "T" + addClock("00:00", startMinute) + ":00"
+  base.end = endDay + "T" + addClock("00:00", endMinute % DAY_MINUTES) + ":00"
+  return base
+}
+
+// Where a draft lies on one day's rail, in minutes, or null when it is not
+// a timed event starting that day. Its end is cut at midnight.
+function draftSpanOn(draft, dayKey) {
+  if (!draft || draft.allDay || draft.startDate !== dayKey) return null
+  if (!isClock(draft.startTime) || !isClock(draft.endTime)) return null
+  var start = Number(draft.startTime.slice(0, 2)) * 60 + Number(draft.startTime.slice(3, 5))
+  var end = draft.endDate > dayKey ? DAY_MINUTES
+    : Number(draft.endTime.slice(0, 2)) * 60 + Number(draft.endTime.slice(3, 5))
+  return { start: start, end: Math.max(start, end) }
+}
+
+// The span's times, as the block being drawn says them.
+function spanLabel(startMinute, endMinute, timeFormat) {
+  function at(minute) {
+    return formatTime("2000-01-01T" + addClock("00:00", minute % DAY_MINUTES), timeFormat)
+  }
+  return at(startMinute) + " \u2013 " + at(endMinute)
+}
+
 // A copy of an event, as a new event's starting point: everything that
 // describes it, on the occurrence that was open, but nothing that ties it to
 // the original — no uid, no href, no etag. Invitees are left off, since

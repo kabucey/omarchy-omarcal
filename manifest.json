@@ -37,6 +37,7 @@
       "contactsEnabled": false,
       "placesProvider": "none",
       "defaultCalendar": "",
+      "collapsedGroups": [],
       "updateCheck": true,
       "updateDismissed": "",
       "updateCheckedAt": 0,

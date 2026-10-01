@@ -194,6 +194,9 @@ DEFAULT_SETTINGS = {
     # The calendar a new event is added to, by URL. Empty means the
     # writable calendar with the most events.
     "defaultCalendar": "",
+    # The calendar list's groups folded away, by account id or
+    # "subscriptions".
+    "collapsedGroups": [],
 }
 
 

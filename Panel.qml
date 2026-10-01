@@ -642,6 +642,17 @@ Panel {
   readonly property color hairline: Logic.ensureContrast(
     String(Color.muted), String(Color.popups.background), 3.0)
 
+  // The calendar list, grouped, and which of its groups are folded away.
+  readonly property var calendarGroups: Logic.sidebarGroups(
+    service ? service.accounts : [], calendars)
+  readonly property var collapsedGroups: {
+    var stored = pref("collapsedGroups", [])
+    return Array.isArray(stored) ? stored : []
+  }
+  function toggleGroup(key) {
+    setPref("collapsedGroups", Logic.withGroupToggled(collapsedGroups, key))
+  }
+
   property bool calendarSidebarCollapsed:
     pref("calendarSidebarCollapsed", false) === true
   property bool daySidebarCollapsed:
@@ -1862,125 +1873,182 @@ Panel {
   // a BorderSurface at Style.space(30), filled when selected and again under
   // the pointer, outlined when selected, with a glyph and one label. Its
   // search results use a taller two-line row; this list is the browse one.
+  // One calendar in the list. Its colour is said once, by the swatch:
+  // filled while the calendar shows, an outline while it does not, whose
+  // name then steps back too. Everything else a calendar can be asked to do
+  // is behind the ⋯ that appears on the row under the pointer, or a right
+  // click anywhere on it, so a long list reads as names rather than a
+  // column of identical icons. A failed sync is the one thing always shown,
+  // as a warning that opens the same menu with the reason in it.
   component CalendarRow: BorderSurface {
     id: row
     property var entry: ({})
+    // The account the calendar belongs to: for a feed, its own settings.
+    property var account: null
+    property bool isFeed: false
     property color foreground: "white"
     property string fontFamily: ""
     readonly property bool picked: entry.enabled !== false
     readonly property bool failed: !!entry.error
     readonly property bool syncing:
       !!(root.service && root.service.syncingCalendar === entry.url)
+    readonly property color tint: entry.color || Color.accent
+    readonly property bool hot: rowHover.hovered || rowMenu.opened
     signal toggled()
     signal syncRequested()
     signal colorRequested(real buttonX, real buttonBottom)
-    // The calendar's own colour, not the theme accent: on a list where every
-    // row is a different calendar, the fill is the quickest way to tell which
-    // is which, and it already matches the events on the month. A departure
-    // from omedia's library row, which has one accent because it lists one
-    // kind of thing.
-    readonly property color tint: entry.color || Color.accent
+    signal settingsRequested()
 
-    height: Style.space(30)
+    height: Style.space(26)
     radius: Style.spacing.labelGap
-    color: row.picked ? Util.alpha(row.tint, 0.2)
-         : rowArea.containsMouse ? Style.normalFillFor(row.foreground, Color.accent)
-         : "transparent"
-    // No outline. The fill is the calendar's colour and it already says which
-    // rows are on; a border around it only competed with that.
+    color: row.hot ? Style.normalFillFor(row.foreground, Color.accent) : "transparent"
     borderSpec: Border.none()
+
+    // A handler rather than the MouseArea's own hover, so the row stays lit
+    // while the pointer is on the ⋯ inside it.
+    HoverHandler { id: rowHover }
 
     MouseArea {
       id: rowArea
       anchors.fill: parent
-      hoverEnabled: true
+      acceptedButtons: Qt.LeftButton | Qt.RightButton
       cursorShape: Qt.PointingHandCursor
-      onClicked: row.toggled()
+      onClicked: function (mouse) {
+        if (mouse.button === Qt.RightButton) row.openMenu(mouse.x, mouse.y)
+        else row.toggled()
+      }
     }
 
-    // This calendar alone, for when only it is suspected of being behind.
-    // Always there rather than appearing under the pointer: a control that
-    // only exists while you are on top of it cannot be found by looking.
-    // Its own sibling, not part of the row beside it, so the gap before it
-    // can be tighter than the one between the box and the name.
-    Button {
-      id: rowSync
+    function openMenu(atX, atY) {
+      rowMenu.x = Math.max(0, Math.min(row.width - rowMenu.width, atX))
+      rowMenu.y = atY
+      rowMenu.open()
+    }
+
+    // Under the row's right edge, where the ⋯ was.
+    function openMenuHere() { openMenu(row.width - rowMenu.width, row.height) }
+
+    Row {
+      id: rowEnd
       anchors.right: parent.right
       anchors.rightMargin: Style.space(4)
       anchors.verticalCenter: parent.verticalCenter
-      width: Style.space(22)
-      height: Style.space(22)
-      iconText: "\uf021"
-      iconSize: Style.font.caption
-      iconSpinning: row.syncing
-      horizontalPadding: Style.space(3)
-      verticalPadding: Style.space(1)
-      tooltipText: "Sync this calendar"
-      foreground: row.foreground
-      fontFamily: row.fontFamily
-      onClicked: row.syncRequested()
-    }
+      spacing: Style.space(2)
 
-    // Recolour the calendar. The feed and the CalDAV alike: the colour is
-    // ours to pick, and the one beside a row of other calendars is the one
-    // that matters.
-    Button {
-      id: rowColor
-      anchors.right: rowSync.left
-      anchors.rightMargin: Style.space(4)
-      anchors.verticalCenter: parent.verticalCenter
-      width: Style.space(22)
-      height: Style.space(22)
-      iconText: "\uf1fc"
-      iconSize: Style.font.caption
-      horizontalPadding: Style.space(3)
-      verticalPadding: Style.space(1)
-      tooltipText: "Calendar color"
-      foreground: row.foreground
-      fontFamily: row.fontFamily
-      onClicked: {
-        // The picker opens in the panel's coordinates, so take the button's
-        // corner there and let it do the rest.
-        var point = rowColor.mapToItem(keyCatcher, 0, 0)
-        row.colorRequested(point.x + rowColor.width / 2,
-                           point.y + rowColor.height)
+      // Turning while this calendar syncs, then gone.
+      Text {
+        visible: row.syncing
+        anchors.verticalCenter: parent.verticalCenter
+        textFormat: Text.PlainText
+        text: "\uf021"
+        color: root.subdued
+        font.family: row.fontFamily
+        font.pixelSize: Style.font.caption
+        RotationAnimation on rotation {
+          running: row.syncing
+          from: 0; to: 360; duration: 1000
+          loops: Animation.Infinite
+        }
+      }
+
+      Button {
+        visible: row.failed
+        width: Style.space(22)
+        height: Style.space(22)
+        iconText: "\uf071"
+        iconSize: Style.font.caption
+        horizontalPadding: Style.space(3)
+        verticalPadding: Style.space(1)
+        tooltipText: "Couldn\u2019t sync"
+        foreground: root.danger
+        fontFamily: row.fontFamily
+        onClicked: row.openMenuHere()
+      }
+
+      Button {
+        visible: row.hot
+        width: Style.space(22)
+        height: Style.space(22)
+        iconText: "\uf141"
+        iconSize: Style.font.caption
+        horizontalPadding: Style.space(3)
+        verticalPadding: Style.space(1)
+        tooltipText: "Calendar options"
+        foreground: row.foreground
+        fontFamily: row.fontFamily
+        onClicked: row.openMenuHere()
       }
     }
 
-    Row {
+    Rectangle {
+      id: swatch
       anchors.left: parent.left
-      anchors.right: rowColor.left
       anchors.leftMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      width: Style.space(12)
+      height: width
+      radius: Style.space(3)
+      color: row.picked ? row.tint : "transparent"
+      border.width: row.picked ? 0 : Math.max(1, Style.space(1.5))
+      border.color: row.tint
+    }
+
+    Text {
+      anchors.left: swatch.right
+      anchors.right: rowEnd.left
+      anchors.leftMargin: Style.space(10)
       anchors.rightMargin: Style.space(4)
       anchors.verticalCenter: parent.verticalCenter
-      spacing: Style.space(10)
+      textFormat: Text.PlainText
+      text: Logic.singleLine(row.entry.name)
+      elide: Text.ElideRight
+      color: row.picked ? row.foreground : root.subdued
+      font.family: row.fontFamily
+      font.pixelSize: Style.font.bodySmall
+    }
 
-      // The calendar's own colour carries the identity, so the box takes it
-      // rather than the foreground a track row uses. Hidden is the same box
-      // as an outline, so the colour still reads.
-      Text {
-        id: rowIcon
-        anchors.verticalCenter: parent.verticalCenter
-        textFormat: Text.PlainText
-        text: row.picked ? "\uf14a" : "\uf096"
-        color: row.entry.color || Color.accent
-        opacity: row.picked ? 1.0 : 0.7
-        font.family: row.fontFamily
-        font.pixelSize: Style.font.icon
-      }
+    MenuPopup {
+      id: rowMenu
+      width: Style.space(190)
+      focus: true
+      closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutsideParent
 
-      Text {
-        anchors.verticalCenter: parent.verticalCenter
-        width: parent.width - rowIcon.width - parent.spacing
-        textFormat: Text.PlainText
-        // One line, like the browse row. A calendar that failed to sync says
-        // so by colour; the message itself is in the panel's footer.
-        text: Logic.singleLine(row.entry.name)
-        elide: Text.ElideRight
-        color: row.failed ? root.danger : row.foreground
-        font.family: row.fontFamily
-        font.pixelSize: Style.font.bodySmall
-        font.bold: row.picked
+      contentItem: Column {
+        spacing: Style.spacing.labelGap
+
+        // Why it failed, said where the way to try again is.
+        MenuCaption {
+          visible: row.failed
+          width: rowMenu.availableWidth
+          text: row.entry.error || ""
+          color: root.danger
+        }
+
+        MenuRow {
+          width: rowMenu.availableWidth
+          label: row.failed ? "Try again" : "Sync now"
+          enabled: !row.syncing
+          opacity: enabled ? 1.0 : 0.4
+          onActivated: { rowMenu.close(); row.syncRequested() }
+        }
+
+        MenuRow {
+          width: rowMenu.availableWidth
+          label: "Color\u2026"
+          onActivated: {
+            rowMenu.close()
+            // The picker opens in the panel's coordinates.
+            var point = row.mapToItem(keyCatcher, row.width - Style.space(30), 0)
+            row.colorRequested(point.x, point.y + row.height)
+          }
+        }
+
+        MenuRow {
+          visible: row.isFeed
+          width: rowMenu.availableWidth
+          label: "Subscription settings\u2026"
+          onActivated: { rowMenu.close(); row.settingsRequested() }
+        }
       }
     }
   }
@@ -3290,96 +3358,148 @@ Panel {
           Column {
             id: calendarList
             width: sidebar.width
-            spacing: Style.spacing.md * 2
+            spacing: Style.spacing.md + Style.spacing.sm
 
-            // Each identity owns the calendar rows immediately below it.
-            // Stable provider-qualified IDs keep same-address Google and
-            // iCloud accounts in their own groups.
+            // Each account heads its own calendars, and every calendar added
+            // by URL shares one Subscriptions group at the foot. A group's
+            // header folds it away; folded, it says how many are showing.
             Repeater {
-              model: root.service ? root.service.accounts : []
+              model: root.calendarGroups
 
               Column {
-                id: accountGroup
+                id: calendarGroup
                 required property var modelData
-                readonly property var accountCalendars: Logic.calendarsForAccount(
-                  root.calendars, modelData.id || modelData.user || "",
-                  modelData.user || "")
+                readonly property bool folded:
+                  root.collapsedGroups.indexOf(modelData.key) >= 0
                 width: sidebar.width
-                spacing: Style.space(4)
+                spacing: Style.space(2)
 
                 Item {
                   width: parent.width
-                  implicitHeight: Math.max(accountLabels.implicitHeight,
-                                           accountEdit.implicitHeight)
+                  implicitHeight: Math.max(groupLabels.implicitHeight, root.controlSize)
+
+                  MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.toggleGroup(calendarGroup.modelData.key)
+                  }
+
+                  Text {
+                    id: groupChevron
+                    anchors.left: parent.left
+                    anchors.leftMargin: Style.space(2)
+                    anchors.top: groupLabels.top
+                    width: Style.space(14)
+                    textFormat: Text.PlainText
+                    text: calendarGroup.folded ? "\uf054" : "\uf078"
+                    color: root.subdued
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    height: groupTitle.height
+                    verticalAlignment: Text.AlignVCenter
+                  }
 
                   Column {
-                    id: accountLabels
-                    anchors.left: parent.left
-                    anchors.right: accountEdit.left
-                    anchors.rightMargin: Style.spacing.md
+                    id: groupLabels
+                    anchors.left: groupChevron.right
+                    anchors.right: groupEdit.visible ? groupEdit.left : parent.right
+                    anchors.leftMargin: Style.space(4)
+                    anchors.rightMargin: Style.spacing.sm
                     anchors.verticalCenter: parent.verticalCenter
-                    spacing: Style.space(2)
+                    spacing: Style.space(1)
 
-                    PanelSectionHeader {
+                    Item {
                       width: parent.width
-                      elide: Text.ElideRight
-                      text: Logic.accountProviderName(
-                        accountGroup.modelData).toUpperCase()
-                      color: root.foreground
+                      height: groupTitle.implicitHeight
+
+                      Text {
+                        id: groupTitle
+                        anchors.left: parent.left
+                        anchors.right: groupCount.visible ? groupCount.left : parent.right
+                        anchors.rightMargin: Style.spacing.sm
+                        elide: Text.ElideRight
+                        textFormat: Text.PlainText
+                        text: calendarGroup.modelData.title
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        font.weight: Font.DemiBold
+                      }
+
+                      Text {
+                        id: groupCount
+                        visible: calendarGroup.folded
+                        anchors.right: parent.right
+                        anchors.baseline: groupTitle.baseline
+                        textFormat: Text.PlainText
+                        text: Logic.groupCountLabel(calendarGroup.modelData.rows)
+                        color: root.subdued
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
                     }
 
                     Text {
+                      visible: text !== ""
                       width: parent.width
                       elide: Text.ElideRight
                       textFormat: Text.PlainText
-                      text: accountGroup.modelData.user || "Connected account"
+                      text: calendarGroup.modelData.subtitle
                       color: root.subdued
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
                     }
                   }
 
+                  // An account's own settings. Subscriptions have theirs on
+                  // each feed's row, since each feed is an account.
                   Button {
-                    id: accountEdit
+                    id: groupEdit
+                    visible: calendarGroup.modelData.kind === "account"
                     anchors.right: parent.right
                     anchors.verticalCenter: parent.verticalCenter
-                    width: root.controlSize
-                    height: root.controlSize
-                    bordered: true
+                    width: Style.space(26)
+                    height: Style.space(26)
                     iconText: "\uf013"
+                    iconSize: Style.font.caption
                     tooltipText: "Account settings"
-                    foreground: root.foreground
+                    foreground: root.subdued
                     fontFamily: root.fontFamily
-                    onClicked: root.editAccount(accountGroup.modelData)
+                    onClicked: root.editAccount(calendarGroup.modelData.account)
                   }
                 }
 
                 Column {
+                  visible: !calendarGroup.folded
                   width: parent.width
-                  spacing: Style.space(4)
+                  spacing: Style.space(2)
 
                   Repeater {
-                    model: accountGroup.accountCalendars
+                    model: calendarGroup.modelData.rows
 
                     CalendarRow {
                       required property var modelData
-                      width: accountGroup.width
-                      entry: modelData
+                      width: calendarGroup.width
+                      entry: modelData.calendar
+                      account: modelData.account
+                      isFeed: calendarGroup.modelData.kind === "subscriptions"
                       foreground: root.foreground
                       fontFamily: root.fontFamily
                       onToggled: if (root.service)
-                        root.service.setCalendarEnabled(modelData.url, !picked)
+                        root.service.setCalendarEnabled(modelData.calendar.url, !picked)
                       onSyncRequested: if (root.service)
-                        root.service.syncCalendar(modelData.url)
+                        root.service.syncCalendar(modelData.calendar.url)
                       onColorRequested: (buttonX, buttonBottom) =>
-                        colorPicker.openFor(modelData.url, modelData.color,
+                        colorPicker.openFor(modelData.calendar.url, modelData.calendar.color,
                                             buttonX, buttonBottom)
+                      onSettingsRequested: root.editAccount(modelData.account)
                     }
                   }
 
                   Text {
-                    visible: accountGroup.accountCalendars.length === 0
+                    visible: calendarGroup.modelData.rows.length === 0
                     width: parent.width
+                    leftPadding: Style.space(20)
                     text: "No calendars"
                     color: root.subdued
                     font.family: root.fontFamily

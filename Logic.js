@@ -649,6 +649,55 @@ function calendarsForAccount(calendars, accountId, user) {
   })
 }
 
+// The calendar list's groups. An account that signs in somewhere heads its
+// own calendars; every calendar added by URL goes under one Subscriptions
+// group at the foot, since each feed is an account of its own and a header
+// per feed only said the feed's name twice. Each row keeps the account it
+// belongs to, which is where a feed's settings are.
+function sidebarGroups(accounts, calendars) {
+  var groups = [], feeds = []
+  var list = accounts || []
+  for (var i = 0; i < list.length; i++) {
+    var account = list[i]
+    var owned = calendarsForAccount(calendars, account.id || account.user || "",
+                                    account.user || "")
+    var rows = owned.map(function (calendar) {
+      return { calendar: calendar, account: account }
+    })
+    if (providerOption(account) === "Calendar URL") {
+      feeds = feeds.concat(rows)
+      continue
+    }
+    groups.push({
+      key: String(account.id || account.user || ("account-" + i)),
+      kind: "account",
+      title: providerOption(account),
+      subtitle: account.user || "Connected account",
+      account: account,
+      rows: rows
+    })
+  }
+  if (feeds.length)
+    groups.push({ key: "subscriptions", kind: "subscriptions", title: "Subscriptions",
+                  subtitle: "", account: null, rows: feeds })
+  return groups
+}
+
+// What a collapsed group says in place of its rows: how many are showing.
+function groupCountLabel(rows) {
+  var on = 0
+  for (var i = 0; i < (rows || []).length; i++)
+    if (rows[i].calendar && rows[i].calendar.enabled !== false) on++
+  return on + " of " + (rows || []).length + " on"
+}
+
+// The collapsed groups, kept as a list of keys in settings.
+function withGroupToggled(collapsed, key) {
+  var out = (collapsed || []).filter(function (k) { return k !== key })
+  if (out.length === (collapsed || []).length) out.push(key)
+  return out
+}
+
 function accountEmailForId(accounts, accountId) {
   var id = String(accountId || "")
   var rows = accounts || []

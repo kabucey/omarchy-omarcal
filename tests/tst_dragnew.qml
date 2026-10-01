@@ -84,4 +84,21 @@ TestCase {
     compare(Logic.spanLabel(540, 630, "24h"), "09:00 – 10:30")
     compare(Logic.spanLabel(23 * 60, 24 * 60, "24h"), "23:00 – 00:00")
   }
+
+  function test_click_span_is_an_hour_from_the_quarter_clicked() {
+    // 40px an hour: 9:20 is 373px, in the 9:15 quarter.
+    var span = Logic.clickSpan(373, 40, wholeDay)
+    compare(span.start, 9 * 60 + 15)
+    compare(span.end, 10 * 60 + 15)
+  }
+
+  function test_click_span_fits_before_the_rail_ends() {
+    var late = Logic.clickSpan(23.5 * 40, 40, wholeDay)
+    compare(late.start, 23 * 60)
+    compare(late.end, 24 * 60)
+    var work = Logic.dayWindow(8, 18)
+    var top = Logic.clickSpan(-5, 40, work)
+    compare(top.start, 8 * 60)
+    compare(top.end, 9 * 60)
+  }
 }

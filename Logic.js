@@ -2444,6 +2444,18 @@ function dragSpan(anchorMinute, pointMinute, window) {
   return { start: start, end: end }
 }
 
+// A double click's event: an hour from the quarter hour the pointer is in,
+// pulled up the rail as far as it must be to fit before the rail ends.
+function clickSpan(y, hourHeight, window, length) {
+  var from = window ? window.startMinute : 0
+  var to = window ? window.endMinute : DAY_MINUTES
+  var size = Math.min(length || 60, to - from)
+  var raw = from + (Number(y) || 0) * 60 / Math.max(1, hourHeight)
+  var start = Math.floor(raw / DRAG_STEP) * DRAG_STEP
+  start = Math.max(from, Math.min(to - size, start))
+  return { start: start, end: start + size }
+}
+
 // A blank event over a drawn span. An end at 24:00 is midnight of the next
 // day, which is how the rail's last rule reads.
 function newEventAt(dayKey, startMinute, endMinute, calendarUrl) {

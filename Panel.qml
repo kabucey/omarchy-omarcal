@@ -211,17 +211,24 @@ Panel {
     dragNew = { dayKey: dragNew.dayKey, anchor: dragNew.anchor, point: minute, moved: true }
   }
 
-  // Letting go over `block`, the drawn event on screen. A press that never
+  // Letting go over `block`, the rail's drawn event. A press that never
   // became a drag draws nothing and returns false: it was a click.
   function endDraw(block) {
     var drag = dragNew
     if (!drag || !drag.moved) { dragNew = null; return false }
-    var corner = block.mapToItem(keyCatcher, 0, 0)
-    var anchor = Qt.rect(corner.x, corner.y, block.width, block.height)
     var span = Logic.dragSpan(drag.anchor, drag.point, dayWindow)
     dragNew = null
-    startQuickNew(drag.dayKey, span.start, span.end, anchor)
+    startQuickNew(drag.dayKey, span.start, span.end, block.anchorFor(span))
     return true
+  }
+
+  // A double click at `y` down the rail's hours: an hour-long event from
+  // the quarter hour it landed in, in the same popover a drag opens.
+  function clickNew(block, dayKey, y, hourHeight) {
+    dragNew = null
+    if (!canDrawEvent) return
+    var span = Logic.clickSpan(y, hourHeight, dayWindow)
+    startQuickNew(dayKey, span.start, span.end, block.anchorFor(span))
   }
 
   function startQuickNew(dayKey, startMinute, endMinute, anchor) {
@@ -1334,6 +1341,17 @@ Panel {
       Logic.ensureContrast(root.drawnColor, cardFill, 4.5)
     readonly property string title: root.draftOnRail && root.draft
       && Logic.singleLine(root.draft.title) ? Logic.singleLine(root.draft.title) : "New Event"
+
+    // Where the block will be once it shows `wanted`, in keyCatcher's space,
+    // for the popover to be placed beside before the block has moved there.
+    function anchorFor(wanted) {
+      var first = Math.max(wanted.start, root.dayWindow.startMinute)
+      var last = Math.min(wanted.end, root.dayWindow.endMinute)
+      var top = railY + Math.round((first - root.dayWindow.startMinute) * hourHeight / 60)
+      var corner = parent.mapToItem(keyCatcher, x, top)
+      return Qt.rect(corner.x, corner.y, width,
+                     Math.max(root.slotHeight, Math.round((last - first) * hourHeight / 60)))
+    }
 
     visible: span !== null && lastMinute > firstMinute
     y: railY + Math.round((firstMinute - root.dayWindow.startMinute) * hourHeight / 60)
@@ -5266,6 +5284,9 @@ Panel {
                     root.moveDraw(minuteAt(mouse.y))
                   }
                   onReleased: root.endDraw(dayDrawn)
+                  onDoubleClicked: function (mouse) {
+                    root.clickNew(dayDrawn, root.selectedKey, mouse.y, dayView.hourHeight)
+                  }
                   onCanceled: root.dragNew = null
                 }
 
@@ -5578,8 +5599,12 @@ Panel {
 
               Connections {
                 target: root
+                // Picking another day of the week on screen leaves the rail
+                // where it is: the first click of a double click picks the
+                // day, and the second must land on the hour it aimed at.
                 function onSelectedKeyChanged() {
-                  if (root.viewMode === "Week") Qt.callLater(weekRail.toOpeningHour)
+                  if (root.viewMode === "Week" && root.weekKeys.indexOf(root.selectedKey) < 0)
+                    Qt.callLater(weekRail.toOpeningHour)
                 }
                 function onWeekAnchorChanged() {
                   if (root.viewMode === "Week") Qt.callLater(weekRail.toOpeningHour)
@@ -5672,8 +5697,9 @@ Panel {
                       cursorShape: Qt.PointingHandCursor
                       preventStealing: true
                       property real pressY: 0
-                      // Set when this press put the popover away, so its
-                      // click does not also pick the day.
+                      // Set when this press put the popover away, or opened
+                      // it by double clicking, so its release does not also
+                      // pick the day.
                       property bool dismissed: false
 
                       function minuteAt(y) {
@@ -5692,6 +5718,12 @@ Panel {
                         if (!root.dragNew.moved
                             && Math.abs(mouse.y - pressY) < Qt.styleHints.startDragDistance) return
                         root.moveDraw(minuteAt(mouse.y))
+                      }
+                      onDoubleClicked: function (mouse) {
+                        if (mouse.button !== Qt.LeftButton) return
+                        dismissed = true
+                        root.clickNew(weekDrawn, weekDay.modelData, mouse.y,
+                                      weekView.hourHeight)
                       }
                       onReleased: function (mouse) {
                         if (root.endDraw(weekDrawn) || dismissed) return

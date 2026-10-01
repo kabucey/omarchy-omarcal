@@ -12,7 +12,7 @@ import "../Logic.js" as Logic
 // including a nine-day span and several simultaneous appointments.
 //
 // Regenerate with:
-//   ./helper/omarcal-helper events --from 2026-09-01 --to 2026-10-01 \
+//   ./helper/orchard-helper events --from 2026-09-01 --to 2026-10-01 \
 //     > tests/fixture-september.json
 TestCase {
   name: "RealData"

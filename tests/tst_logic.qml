@@ -2,7 +2,7 @@ import QtQuick
 import QtTest
 import "../Logic.js" as Logic
 
-// Tests for Logic.js, the pure functions the omarcal views run.
+// Tests for Logic.js, the pure functions the orchard views run.
 //
 //   QT_QPA_PLATFORM=offscreen /usr/lib/qt6/bin/qmltestrunner -input tests/tst_logic.qml
 //
@@ -587,7 +587,7 @@ TestCase {
   }
 
   // This guide is the only setup path available before the JSON exists. Keep
-  // the required Google Cloud decisions and the handoff back to Omarcal in it.
+  // the required Google Cloud decisions and the handoff back to Orchard in it.
   function test_google_help_covers_the_complete_desktop_client_flow() {
     var guide = Logic.accountHelp("Google")
     var all = guide.steps.map(function (step) {
@@ -604,7 +604,7 @@ TestCase {
            "does not name the Calendar permission")
     verify(all.indexOf("Desktop app") >= 0, "does not create the right client type")
     verify(all.indexOf("Download") >= 0 && all.indexOf("Import Google credentials") >= 0,
-           "does not bring the downloaded JSON back to Omarcal")
+           "does not bring the downloaded JSON back to Orchard")
   }
 
   // The visible provider choices identify their corresponding sign-in paths.

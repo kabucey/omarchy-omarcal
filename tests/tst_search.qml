@@ -80,11 +80,4 @@ TestCase {
     compare(Logic.viewFromKey(""), "Month")
     compare(Logic.viewFromKey(Logic.viewKey("Week")), "Week")
   }
-
-  function test_view_options() {
-    var options = Logic.viewOptions()
-    compare(options.length, 3)
-    compare(options[0].value, "day")
-    compare(options[2].label, "Month")
-  }
 }

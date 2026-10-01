@@ -5,12 +5,12 @@ import qs.Commons
 import qs.Ui
 import "Logic.js" as Logic
 
-// The omarcal clock. Left-click opens the calendar, right-click cycles the
+// The orchard clock. Left-click opens the calendar, right-click cycles the
 // same format ring as Omarchy's clock, and middle-click opens the timezone
 // picker.
 BarWidget {
   id: root
-  moduleName: "lancefaul.omarcal"
+  moduleName: "com.buceylabs.orchard"
 
   property date now: clock.date
 
@@ -124,7 +124,7 @@ BarWidget {
   }
 
   IpcHandler {
-    target: "omarcal"
+    target: "orchard"
 
     function refresh(): void { root.broadcast("refresh") }
     function open(): void { root.open() }

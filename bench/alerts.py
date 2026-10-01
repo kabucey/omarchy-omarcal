@@ -15,14 +15,14 @@ from datetime import datetime, timedelta, timezone
 
 
 ROOT = Path(__file__).resolve().parents[1]
-HELPER = ROOT / "helper" / "omarcal-helper"
-LAUNCHER = ROOT / "helper" / "omarcal"
-NATIVE = ROOT / "helper" / "omarcal-native"
+HELPER = ROOT / "helper" / "orchard-helper"
+LAUNCHER = ROOT / "helper" / "orchard"
+NATIVE = ROOT / "helper" / "orchard-native"
 
 
 def load_helper():
-    loader = importlib.machinery.SourceFileLoader("omarcal_alert_benchmark", str(HELPER))
-    spec = importlib.util.spec_from_loader("omarcal_alert_benchmark", loader)
+    loader = importlib.machinery.SourceFileLoader("orchard_alert_benchmark", str(HELPER))
+    spec = importlib.util.spec_from_loader("orchard_alert_benchmark", loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
@@ -63,9 +63,9 @@ def main():
         parser.error("native helper is missing; build it first with ./helper/build-native")
 
     helper = load_helper()
-    with tempfile.TemporaryDirectory(prefix="omarcal-alert-bench-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="orchard-alert-bench-") as temporary:
         state_home = Path(temporary) / "state"
-        cache_dir = state_home / "omarcal"
+        cache_dir = state_home / "orchard"
         cache_dir.mkdir(parents=True)
         conn = helper.sqlite3.connect(str(cache_dir / "cache.db"))
         conn.executescript(helper.SCHEMA)

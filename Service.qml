@@ -3,12 +3,12 @@ import Quickshell
 import Quickshell.Io
 import "Logic.js" as Logic
 
-// Everything that talks to the omarcal helper launcher.
+// Everything that talks to the orchard helper launcher.
 //
 // The helper always prints one JSON object and exits 0, so a failure arrives
 // as `ok: false` with a code rather than as a crash or empty output. Nothing
 // here blocks: a sync that is slow or wedged leaves the last cached events on
-// screen and sets `error`, which is the whole reason omarcal does not go
+// screen and sets `error`, which is the whole reason orchard does not go
 // through Evolution Data Server.
 QtObject {
   id: root
@@ -78,7 +78,7 @@ QtObject {
   property string rangeEnd: ""
 
   readonly property string helper: decodeURIComponent(
-    Qt.resolvedUrl("helper/omarcal").toString().replace(/^file:\/\//, ""))
+    Qt.resolvedUrl("helper/orchard").toString().replace(/^file:\/\//, ""))
 
   signal eventsLoaded()
   signal accountAdded(int requestId)
@@ -731,7 +731,7 @@ QtObject {
   }
 
   // The helper owns the desktop file picker and copies a valid Desktop OAuth
-  // client into omarcal's private config directory. Running it as a process
+  // client into orchard's private config directory. Running it as a process
   // keeps the picker and file validation off the UI thread.
   property Process googleClientImportProc: Process {
     running: false
@@ -1088,7 +1088,7 @@ QtObject {
       var item = fresh[n]
       Quickshell.execDetached([
         notificationSender,
-        "--app-name", "lancefaul.omarcal",
+        "--app-name", "com.buceylabs.orchard",
         "-g", "󰃭",
         "-u", "critical",
         String(item.title || "Calendar event"),

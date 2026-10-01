@@ -4,7 +4,7 @@ set -eu
 helper_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 crate_dir="$helper_dir/native"
 target_dir="$crate_dir/target"
-output="$helper_dir/omarcal-native"
+output="$helper_dir/orchard-native"
 temporary_output=""
 
 cleanup() {
@@ -18,8 +18,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 cargo build --release --locked --target-dir "$target_dir" --manifest-path "$crate_dir/Cargo.toml"
-temporary_output=$(mktemp "$helper_dir/.omarcal-native.XXXXXX")
-cp "$target_dir/release/omarcal-native" "$temporary_output"
+temporary_output=$(mktemp "$helper_dir/.orchard-native.XXXXXX")
+cp "$target_dir/release/orchard-native" "$temporary_output"
 chmod 755 "$temporary_output"
 mv -f -- "$temporary_output" "$output"
 temporary_output=""

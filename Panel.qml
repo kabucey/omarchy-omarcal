@@ -17,8 +17,8 @@ import "Logic.js" as Logic
 // file only draws.
 Panel {
   id: root
-  moduleName: "lancefaul.omarcal"
-  ipcTarget: "omarcal"
+  moduleName: "com.buceylabs.orchard"
+  ipcTarget: "orchard"
   manageIpc: false
 
   property var anchorItem: null
@@ -926,7 +926,7 @@ Panel {
   // are next, so the group selects but the grid below it does not change yet.
   // Seeded from the setting the first time it arrives, and written back
   // whenever the view changes: picking Week and closing the card should not
-  // put you back on Month, and the setting is what "opens on" means.
+  // put you back on Month. The panel opens on whichever view was last used.
   property string viewMode: "Month"
   property bool viewSeeded: false
 
@@ -1205,7 +1205,7 @@ Panel {
     }
   }
 
-  // The colours a calendar can be drawn in: the small chosen set omarcal
+  // The colours a calendar can be drawn in: the small chosen set orchard
   // ships, held here so a feed added on its own is still picked from it —
   // an infinite swatch would make every feed its own one-off colour. The
   // helper owns the same list (PALETTE) and a new feed takes a swatch no
@@ -2820,7 +2820,7 @@ Panel {
             width: sidebar.width
             title: "Calendar"
             // PanelHero uppercases and letter-spaces this line itself.
-            meta: "Omarcal"
+            meta: "Orchard"
             foreground: root.foreground
             fontFamily: root.fontFamily
             iconComponent: Component {
@@ -3246,14 +3246,6 @@ Panel {
                 onPicked: function (picked) { root.setPref("timeFormat", picked) }
               }
 
-              SettingChoice {
-                label: "Opens on"
-                hint: "Also where the Day, Week and Month buttons leave it."
-                options: Logic.viewOptions()
-                value: Logic.viewKey(root.viewMode)
-                onPicked: function (choice) { root.setView(Logic.viewFromKey(choice)) }
-              }
-
               SettingSwitch {
                 label: "Show week numbers"
                 hint: "The ISO week down the left of the month."
@@ -3569,6 +3561,44 @@ Panel {
                   }
                 }
               }
+
+              FormRule { }
+
+              // ---------------------------------------------------- about
+
+              PanelSectionHeader { width: parent.width; text: "ABOUT" }
+
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: root.service && root.service.installedVersion
+                      ? "Orchard " + root.service.installedVersion : "Orchard"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+
+              // The MIT notice asks for the copyright to travel with the
+              // code; this is the same credit where a person can see it.
+              Text {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+                text: "Built on omarcal by lancefaul, used under the MIT License."
+                color: root.subdued
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Button {
+                bordered: true
+                iconText: "\uf08e"
+                text: "omarcal on GitHub"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                onClicked: Quickshell.execDetached(
+                  ["xdg-open", Logic.upstreamPage()])
+              }
             }
           }
 
@@ -3681,10 +3711,10 @@ Panel {
                   ? "Connected as " + root.setupUser
                     + ". Google access can be revoked from your Google Account."
                   : "Google asks for permission to read and edit your "
-                    + "calendars. Omarcal uses it to show calendars and change "
+                    + "calendars. Orchard uses it to show calendars and change "
                     + "existing events; creating events on Google calendars "
                     + "is not supported yet. Sign in with Google in your "
-                    + "browser. Omarcal never sees your Google password, and "
+                    + "browser. Orchard never sees your Google password, and "
                     + "you can revoke access from your Google Account."
                 color: root.subdued
                 font.family: root.fontFamily
@@ -3762,7 +3792,7 @@ Panel {
                     + "below stops fetching it and removes its cached events."
                   : "Paste the address of a public iCal calendar — the one a "
                     + "calendar app offers under \u201Cadd calendar from URL\u201D. "
-                    + "Omarcal fetches it as it is served, on the same schedule "
+                    + "Orchard fetches it as it is served, on the same schedule "
                     + "as the other calendars. No password, and read-only: it "
                     + "can show the feed, never change it."
                 color: root.subdued
@@ -7118,7 +7148,7 @@ Panel {
             width: parent.width
             wrapMode: Text.WordWrap
             textFormat: Text.PlainText
-            text: "Omarcal stops syncing this calendar and deletes every "
+            text: "Orchard stops syncing this calendar and deletes every "
                 + "event it has cached for it. The calendar itself stays on "
                 + "iCloud, untouched — switching it back on downloads it "
                 + "again from scratch.\n\nTo hide one without deleting "

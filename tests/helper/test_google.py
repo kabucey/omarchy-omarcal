@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
-HELPER = os.path.join(HERE, "..", "..", "helper", "omarcal-helper")
+HELPER = os.path.join(HERE, "..", "..", "helper", "orchard-helper")
 
 # These tests target OAuth/transport/schema behavior and do not parse iCalendar.
 fake_gi = types.ModuleType("gi")
@@ -31,8 +31,8 @@ saved_modules = {name: sys.modules.get(name) for name in ("gi", "gi.repository")
 sys.modules["gi"] = fake_gi
 sys.modules["gi.repository"] = fake_repository
 try:
-    _loader = importlib.machinery.SourceFileLoader("omarcal_helper_google", HELPER)
-    _spec = importlib.util.spec_from_loader("omarcal_helper_google", _loader)
+    _loader = importlib.machinery.SourceFileLoader("orchard_helper_google", HELPER)
+    _spec = importlib.util.spec_from_loader("orchard_helper_google", _loader)
     helper = importlib.util.module_from_spec(_spec)
     _loader.exec_module(helper)
 finally:
@@ -287,11 +287,11 @@ class GoogleClientImport(unittest.TestCase):
                 stream.write(b"leave explicit override alone")
             selected = {"ok": True, "picked": True, "path": source}
 
-            with patch.dict(os.environ, {"OMARCAL_GOOGLE_CLIENT_FILE": original_override},
+            with patch.dict(os.environ, {"ORCHARD_GOOGLE_CLIENT_FILE": original_override},
                             clear=False):
                 result = self._run_import(config_home, selected)
 
-            destination = os.path.join(config_home, "omarcal", "google-client.json")
+            destination = os.path.join(config_home, "orchard", "google-client.json")
             self.assertEqual(result, {"ok": True, "imported": True, "path": destination})
             with open(destination, "rb") as stream:
                 self.assertEqual(stream.read(), payload)
@@ -304,7 +304,7 @@ class GoogleClientImport(unittest.TestCase):
             result = self._run_import(temporary, {"ok": True, "picked": False})
             self.assertEqual(result, {"ok": True, "imported": False, "cancelled": True})
             self.assertFalse(os.path.exists(os.path.join(
-                temporary, "omarcal", "google-client.json")))
+                temporary, "orchard", "google-client.json")))
 
     def test_cli_import_rejects_invalid_json_without_replacing_existing_client(self):
         invalid_payloads = [
@@ -318,7 +318,7 @@ class GoogleClientImport(unittest.TestCase):
             b"{" + b" " * (helper.GOOGLE_CLIENT_MAX_BYTES + 1),
         ]
         with tempfile.TemporaryDirectory() as temporary:
-            destination = os.path.join(temporary, "omarcal", "google-client.json")
+            destination = os.path.join(temporary, "orchard", "google-client.json")
             os.makedirs(os.path.dirname(destination))
             with open(destination, "wb") as stream:
                 stream.write(b"previous valid client")

@@ -1,6 +1,6 @@
 .pragma library
 
-// Pure functions used by the omarcal views, kept here so tests/tst_logic.qml
+// Pure functions used by the orchard views, kept here so tests/tst_logic.qml
 // can exercise exactly the code the widget runs.
 //
 // Everything works on the shapes the backend emits:
@@ -535,7 +535,7 @@ var APP_PASSWORD_STEPS = [
     text: "It sits inside Sign-In & Security. Choose to generate a new one.",
     link: "" },
   { title: "Name it",
-    text: "Something you will recognise on that list a year from now — omarcal, for instance.",
+    text: "Something you will recognise on that list a year from now — orchard, for instance.",
     link: "" },
   { title: "Enter your Apple ID password",
     text: "Apple asks for your real password to confirm it is you. That one stays with Apple; it is not what you paste here.",
@@ -559,7 +559,7 @@ var GOOGLE_OAUTH_STEPS = [
     text: "Open the Calendar API page for that project and choose Enable.",
     link: "https://console.cloud.google.com/apis/library/calendar-json.googleapis.com" },
   { title: "Enable the CalDAV API",
-    text: "Open the CalDAV API page for the same project and choose Enable. Omarcal uses this interface to sync the events inside each calendar.",
+    text: "Open the CalDAV API page for the same project and choose Enable. Orchard uses this interface to sync the events inside each calendar.",
     link: "https://console.cloud.google.com/apis/library/caldav.googleapis.com" },
   { title: "Set up the Google Auth Platform",
     text: "Under Branding, enter an app name, support email and contact email. Under Audience, use Internal only for your Google Workspace organisation; otherwise use External.",
@@ -568,13 +568,13 @@ var GOOGLE_OAUTH_STEPS = [
     text: "If the Audience is External and the app is in Testing, open Audience and add the Google account whose calendars you will connect.",
     link: "" },
   { title: "Add Calendar access",
-    text: "Under Data Access, add the scope https://www.googleapis.com/auth/calendar so Omarcal can sync and update calendars.",
+    text: "Under Data Access, add the scope https://www.googleapis.com/auth/calendar so Orchard can sync and update calendars.",
     link: "" },
   { title: "Create a Desktop app client",
-    text: "Open Clients, choose Create client, select Desktop app, give it a name such as Omarcal, and create it.",
+    text: "Open Clients, choose Create client, select Desktop app, give it a name such as Orchard, and create it.",
     link: "https://console.cloud.google.com/auth/clients" },
   { title: "Download the JSON file",
-    text: "Download that client's JSON credentials. Keep the file private; Omarcal will copy it into its own configuration folder.",
+    text: "Download that client's JSON credentials. Keep the file private; Orchard will copy it into its own configuration folder.",
     link: "" },
   { title: "Import it here",
     text: "Close this guide, choose Import Google credentials, select the downloaded JSON file, then choose Continue with Google.",
@@ -595,7 +595,7 @@ function accountHelp(provider) {
         text: "Calendar apps offer one under \u201Cadd new calendar from URL\u201D or in a calendar\u2019s sharing or export settings. It usually ends in .ics.",
         link: "" },
       { title: "Paste it into the form",
-        text: "Omarcal fetches the address on the same schedule as your other calendars. It is read as served and never changed, so no password is needed.",
+        text: "Orchard fetches the address on the same schedule as your other calendars. It is read as served and never changed, so no password is needed.",
         link: "" }
     ] }
   return { title: "App-specific password", meta: "iCloud",
@@ -1450,12 +1450,6 @@ function weekNaturalRows(dayKeys, buckets) {
 // Stored lower case, because that is how the first schema wrote it and a
 // settings table is not worth a migration over a capital letter.
 
-function viewOptions() {
-  return [{ value: "day", label: "Day" },
-          { value: "week", label: "Week" },
-          { value: "month", label: "Month" }]
-}
-
 function viewKey(mode) {
   var name = String(mode || "").toLowerCase()
   return name === "day" || name === "week" ? name : "month"
@@ -1531,10 +1525,12 @@ function searchLimit() { return SEARCH_LIMIT }
 // The third copy of this, after omedia and archamp, and deliberately the same
 // one: an updater is not a place to have ideas.
 
-var PLUGIN_ID = "lancefaul.omarcal"
+var PLUGIN_ID = "com.buceylabs.orchard"
 var RELEASES_API =
-  "https://api.github.com/repos/kabucey/omarchy-omarcal/releases/latest"
-var RELEASES_PAGE = "https://github.com/kabucey/omarchy-omarcal/releases/"
+  "https://api.github.com/repos/kabucey/omarchy-orchard/releases/latest"
+var RELEASES_PAGE = "https://github.com/kabucey/omarchy-orchard/releases/"
+// Orchard began as omarcal; Settings → About links back to it.
+var UPSTREAM_PAGE = "https://github.com/lancefaul/omarchy-omarcal"
 var UPDATE_COMMAND = ["omarchy", "plugin", "update", PLUGIN_ID, "--yes"]
 var RESTART_COMMAND = ["omarchy", "restart", "shell"]
 var UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000
@@ -1546,6 +1542,7 @@ var UPDATE_ATTEMPT_TIMEOUT_MS = 5 * 60 * 1000
 function updateCommand() { return UPDATE_COMMAND }
 function restartCommand() { return RESTART_COMMAND }
 function releasesPage() { return RELEASES_PAGE }
+function upstreamPage() { return UPSTREAM_PAGE }
 function releasesApi() { return RELEASES_API }
 function updateCheckInterval() { return UPDATE_CHECK_INTERVAL_MS }
 
@@ -2824,7 +2821,7 @@ function deleteRequest(base, seed, scope) {
 
 // What the foot says after a write came back.
 function writeOutcome(action, payload) {
-  if (!payload) return { done: false, message: "omarcal could not reach its helper." }
+  if (!payload) return { done: false, message: "orchard could not reach its helper." }
   if (!payload.ok) return { done: false, conflict: payload.code === "conflict",
                             message: payload.error || "That did not save." }
   if (payload.queued)
@@ -3107,7 +3104,7 @@ function placesPermissionText(provider) {
     ? "Nominatim searches only when you press Search \u2014 its rules do not "
       + "allow suggestions as you type."
     : "Photon suggests places as you type, once there are three letters."
-  return "Omarcal will send what you type in Address to " + who + " to find "
+  return "Orchard will send what you type in Address to " + who + " to find "
        + "places. The text you type and your IP address go to their servers; "
        + "nothing else from your calendar is sent.\n\n" + when + "\n\n"
        + "Addresses you have used before are always suggested from your own "
@@ -3129,11 +3126,11 @@ function placesStatusLine(provider) {
 // person agrees to is the wording that was tested.
 
 function contactsPermissionText() {
-  return "Omarcal will read the names and email addresses in your iCloud "
+  return "Orchard will read the names and email addresses in your iCloud "
        + "Contacts, using the account you already connected, and keep them on "
        + "this computer to suggest people as you type an invitee. Nothing else "
        + "in a contact is kept, and nothing is sent anywhere.\n\n"
-       + "Turning this off deletes every contact omarcal has kept."
+       + "Turning this off deletes every contact orchard has kept."
 }
 
 function contactsStatusLine(enabled, count, error) {

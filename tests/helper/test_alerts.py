@@ -13,12 +13,12 @@ from datetime import datetime, timedelta, timezone
 
 sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
-HELPER = os.path.join(HERE, "..", "..", "helper", "omarcal-helper")
+HELPER = os.path.join(HERE, "..", "..", "helper", "orchard-helper")
 HELPER_DIR = os.path.dirname(HELPER)
-LAUNCHER = os.path.join(HELPER_DIR, "omarcal")
-NATIVE = os.path.join(HELPER_DIR, "omarcal-native")
-_loader = importlib.machinery.SourceFileLoader("omarcal_helper_alerts", HELPER)
-_spec = importlib.util.spec_from_loader("omarcal_helper_alerts", _loader)
+LAUNCHER = os.path.join(HELPER_DIR, "orchard")
+NATIVE = os.path.join(HELPER_DIR, "orchard-native")
+_loader = importlib.machinery.SourceFileLoader("orchard_helper_alerts", HELPER)
+_spec = importlib.util.spec_from_loader("orchard_helper_alerts", _loader)
 helper = importlib.util.module_from_spec(_spec)
 _loader.exec_module(helper)
 
@@ -136,7 +136,7 @@ class AlertCacheAndBackend(unittest.TestCase):
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
         self.state_home = os.path.join(self.folder.name, "state")
-        cache_dir = os.path.join(self.state_home, "omarcal")
+        cache_dir = os.path.join(self.state_home, "orchard")
         os.makedirs(cache_dir)
         self.conn = sqlite3.connect(os.path.join(cache_dir, "cache.db"))
         self.conn.executescript(helper.SCHEMA)
@@ -217,9 +217,9 @@ class AlertCacheAndBackend(unittest.TestCase):
         # intentionally has no native executable beside it.
         install = os.path.join(self.folder.name, "plugin", "helper")
         os.makedirs(install)
-        launcher = os.path.join(install, "omarcal")
+        launcher = os.path.join(install, "orchard")
         shutil.copy2(LAUNCHER, launcher)
-        shutil.copy2(HELPER, os.path.join(install, "omarcal-helper"))
+        shutil.copy2(HELPER, os.path.join(install, "orchard-helper"))
         alerts = self.run_alert_command(launcher, start - timedelta(minutes=7), end)
         self.assertEqual([item["title"] for item in alerts], ["Fallback"])
         self.assertEqual(alerts[0]["at"],
@@ -237,9 +237,9 @@ class AlertCacheAndBackend(unittest.TestCase):
         # response proves that the executable served the cached alert.
         install = os.path.join(self.folder.name, "native-only", "helper")
         os.makedirs(install)
-        launcher = os.path.join(install, "omarcal")
+        launcher = os.path.join(install, "orchard")
         shutil.copy2(LAUNCHER, launcher)
-        shutil.copy2(NATIVE, os.path.join(install, "omarcal-native"))
+        shutil.copy2(NATIVE, os.path.join(install, "orchard-native"))
         alerts = self.run_alert_command(launcher, range_start, range_end)
         self.assertEqual([item["title"] for item in alerts], ["Before change"])
         self.assertEqual(alerts[0]["at"],

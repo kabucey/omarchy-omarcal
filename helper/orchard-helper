@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""omarcal-helper — the omarcal backend.
+"""orchard-helper — the orchard backend.
 
 Talks CalDAV directly over pooled HTTPS connections instead of going through
 Evolution Data Server, so every request carries a real socket timeout and a
@@ -108,12 +108,29 @@ SYNC_WORKERS = 4
 MAX_EXPAND = 20000
 MAX_DAV_REDIRECTS = 5
 
-KEYRING_SCHEMA = "org.omarchy.omarcal"
+KEYRING_SCHEMA = "com.buceylabs.orchard"
 
 STATE_DIR = os.path.join(
-    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "omarcal"
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "orchard"
 )
 DB_PATH = os.path.join(STATE_DIR, "cache.db")
+
+# Orchard began as omarcal, and an install from before the rename still keeps
+# its cache, its Google client and its keyring entries under that name. Each
+# is moved across the first time it is looked for, and left alone after.
+LEGACY_NAME = "omarcal"
+LEGACY_KEYRING_SCHEMA = "org.omarchy.omarcal"
+
+
+def adopt_legacy_dir(current: str) -> None:
+    """Rename omarcal's directory beside `current` to it, if only that exists."""
+    legacy = os.path.join(os.path.dirname(current), LEGACY_NAME)
+    if os.path.exists(current) or not os.path.isdir(legacy):
+        return
+    try:
+        os.rename(legacy, current)
+    except OSError:
+        pass
 
 def system_zone():
     """The machine's zone with its rules, not today's offset.
@@ -183,8 +200,40 @@ DEFAULT_SETTINGS = {
 # ---------------------------------------------------------------- credentials
 
 
+def adopt_legacy_secret(attributes: list[str], label: str) -> str:
+    """A secret still filed under omarcal's schema, refiled under Orchard's.
+
+    `attributes` are the lookup pairs after the schema. Returns "" when there
+    is nothing to adopt; a failed refile still returns what was found, so the
+    account keeps working and the move is tried again next time.
+    """
+    try:
+        done = subprocess.run(
+            ["secret-tool", "lookup", "schema", LEGACY_KEYRING_SCHEMA, *attributes],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    secret = done.stdout.strip("\n") if done.returncode == 0 else ""
+    if not secret:
+        return ""
+    try:
+        subprocess.run(
+            ["secret-tool", "store", "--label", label,
+             "schema", KEYRING_SCHEMA, *attributes],
+            input=secret, text=True, capture_output=True, check=True, timeout=10,
+        )
+        subprocess.run(
+            ["secret-tool", "clear", "schema", LEGACY_KEYRING_SCHEMA, *attributes],
+            capture_output=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return secret
+
+
 def load_password(account: str) -> str:
-    override = os.environ.get("OMARCAL_PASSWORD")
+    override = os.environ.get("ORCHARD_PASSWORD")
     if override:
         return override
     try:
@@ -196,6 +245,9 @@ def load_password(account: str) -> str:
             return done.stdout.strip("\n")
     except (OSError, subprocess.SubprocessError):
         pass
+    adopted = adopt_legacy_secret(["account", account], f"orchard ({account})")
+    if adopted:
+        return adopted
     raise Failure("no-password", f"no stored password for {account}")
 
 
@@ -222,12 +274,12 @@ def stored_password(account: str) -> str:
             return done.stdout.strip("\n")
     except (OSError, subprocess.SubprocessError):
         pass
-    return ""
+    return adopt_legacy_secret(["account", account], f"orchard ({account})")
 
 
 def store_password(account: str, password: str) -> None:
     subprocess.run(
-        ["secret-tool", "store", "--label", f"omarcal ({account})",
+        ["secret-tool", "store", "--label", f"orchard ({account})",
          "schema", KEYRING_SCHEMA, "account", account],
         input=password, text=True, capture_output=True, check=True, timeout=10,
     )
@@ -247,6 +299,10 @@ def load_google_refresh_token(account_id: str) -> str:
     except (OSError, subprocess.SubprocessError) as error:
         raise Failure("keyring", "could not read the Google sign-in from the keyring") from error
     if done.returncode != 0 or not done.stdout:
+        adopted = adopt_legacy_secret(_google_keyring_args(account_id)[2:],
+                                      "orchard (Google Calendar)")
+        if adopted:
+            return adopted
         raise Failure("no-credential", "Google sign-in is missing; connect the account again")
     return done.stdout.strip("\n")
 
@@ -257,15 +313,18 @@ def stored_google_refresh_token(account_id: str) -> str:
             ["secret-tool", "lookup", *_google_keyring_args(account_id)],
             capture_output=True, text=True, timeout=10,
         )
-        return done.stdout.strip("\n") if done.returncode == 0 else ""
+        if done.returncode == 0 and done.stdout:
+            return done.stdout.strip("\n")
     except (OSError, subprocess.SubprocessError):
         return ""
+    return adopt_legacy_secret(_google_keyring_args(account_id)[2:],
+                               "orchard (Google Calendar)")
 
 
 def store_google_refresh_token(account_id: str, refresh_token: str) -> None:
     try:
         subprocess.run(
-            ["secret-tool", "store", "--label", "omarcal (Google Calendar)",
+            ["secret-tool", "store", "--label", "orchard (Google Calendar)",
              *_google_keyring_args(account_id)],
             input=refresh_token, text=True, capture_output=True,
             check=True, timeout=10,
@@ -288,7 +347,9 @@ def forget_google_refresh_token(account_id: str) -> None:
 
 def _google_client_config_path() -> str:
     config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-    return os.path.join(config_home, "omarcal", "google-client.json")
+    directory = os.path.join(config_home, "orchard")
+    adopt_legacy_dir(directory)
+    return os.path.join(directory, "google-client.json")
 
 
 def _validate_google_client_config(data: bytes) -> dict:
@@ -311,7 +372,7 @@ def _validate_google_client_config(data: bytes) -> dict:
 
 def google_client_config() -> dict:
     """Read a user-supplied Desktop OAuth client; secrets never enter argv or SQLite."""
-    override = os.environ.get("OMARCAL_GOOGLE_CLIENT_FILE", "").strip()
+    override = os.environ.get("ORCHARD_GOOGLE_CLIENT_FILE", "").strip()
     path = override or _google_client_config_path()
     try:
         with open(path, "rb") as source:
@@ -319,7 +380,7 @@ def google_client_config() -> dict:
     except OSError as error:
         raise Failure(
             "google-config",
-            "add a Google Desktop OAuth client JSON file at ~/.config/omarcal/google-client.json",
+            "add a Google Desktop OAuth client JSON file at ~/.config/orchard/google-client.json",
         ) from error
     return _validate_google_client_config(data)
 
@@ -490,8 +551,8 @@ class _OAuthCallbackHandler(BaseHTTPRequestHandler):
                 self.send_error(400, "Google did not return an authorization code")
                 return
             self.server.result = {"code": codes[0]}
-        content = (b"<html><title>Omarcal</title><body>Google sign-in is complete. "
-                   b"You can return to Omarcal.</body></html>")
+        content = (b"<html><title>Orchard</title><body>Google sign-in is complete. "
+                   b"You can return to Orchard.</body></html>")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
@@ -594,7 +655,7 @@ class DavSession:
             raise Failure("dav-origin", "Google DAV server is outside its trusted origin")
         token = base64.b64encode(f"{user}:{password}".encode()).decode("ascii")
         self.headers = {
-            "User-Agent": "omarcal/0.1",
+            "User-Agent": "orchard/0.1",
             "Content-Type": "application/xml; charset=utf-8",
         }
         if self.provider == "google":
@@ -1156,6 +1217,7 @@ def migrate(conn) -> None:
 
 
 def db() -> sqlite3.Connection:
+    adopt_legacy_dir(STATE_DIR)
     os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -1264,7 +1326,7 @@ def persist_account(conn, account_id: str, user: str, identity: str,
 # A calendar that is a single URL — the .ics address calendar apps offer
 # under "add calendar from URL". There is no protocol on either side beyond
 # GET: no discovery, no sync token, no credentials. The address serves a
-# calendar and omarcal fetches it as-is, so such an account holds exactly
+# calendar and orchard fetches it as-is, so such an account holds exactly
 # one calendar, it is read-only, and a change is seen only when the fetched
 # bytes change. Everything else — the cache, the window, search, alerts —
 # is the same rows as any other calendar's.
@@ -1319,7 +1381,7 @@ def fetch_webcal(url: str) -> bytes:
     Failure carrying what happened, not a crash or a hung process."""
     request = urllib.request.Request(
         url, method="GET",
-        headers={"User-Agent": "omarcal (calendar sync)",
+        headers={"User-Agent": "orchard (calendar sync)",
                  "Accept": "text/calendar"})
     try:
         with urllib.request.urlopen(request, timeout=WEBCAL_TIMEOUT) as response:
@@ -1330,7 +1392,7 @@ def fetch_webcal(url: str) -> bytes:
         reason = getattr(error, "reason", None) or error
         raise Failure("webcal", f"could not reach the calendar ({reason})") from error
     if len(body) > WEBCAL_MAX_BYTES:
-        raise Failure("webcal", "the calendar is larger than omarcal will fetch (8 MB)")
+        raise Failure("webcal", "the calendar is larger than orchard will fetch (8 MB)")
     return body
 
 
@@ -2206,7 +2268,7 @@ def events(conn, start: datetime, end: datetime, only: list[str]) -> dict:
     }
 
 
-# Imported alert choices top out at a week in Omarcal, but provider-created
+# Imported alert choices top out at a week in Orchard, but provider-created
 # alarms can be earlier. This is only an SQL prefilter: open-ended series are
 # always included, and a month keeps the frequent poll from parsing the whole
 # cache while leaving ample room beyond every alert this UI can create.
@@ -2452,7 +2514,7 @@ def alert_timezone_fingerprint() -> str:
     except OSError:
         zone_rules = ""
     material = "\0".join((
-        "omarcal-alert-tz-v1", local_zone_name(), os.environ.get("TZ", ""), zone_rules,
+        "orchard-alert-tz-v1", local_zone_name(), os.environ.get("TZ", ""), zone_rules,
     ))
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
@@ -3602,7 +3664,7 @@ def add_zone(parsed, zones: Zones) -> None:
 
 def blank_calendar() -> object:
     return ICal.Component.new_from_string(
-        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//omarcal//omarcal//EN\r\n"
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//orchard//orchard//EN\r\n"
         "CALSCALE:GREGORIAN\r\nEND:VCALENDAR\r\n")
 
 
@@ -4170,7 +4232,7 @@ def restore_after_attachments(session: DavSession, url: str, sent: str) -> str:
     iCloud rewrites the event on attachment-add and attachment-remove and
     leaves out its alarms and its travel time (probed 2026-09-21: VALARM and
     X-APPLE-TRAVEL-DURATION both gone after one attachment-add). So the event
-    goes back as omarcal wrote it, with the ATTACH lines iCloud now has in
+    goes back as orchard wrote it, with the ATTACH lines iCloud now has in
     place of the ones it had — conditional on iCloud's new etag, so nothing
     written in between is overwritten. Returns a problem in words, or "".
     """
@@ -4235,7 +4297,7 @@ def account_of_url(conn, url: str) -> str:
 def account_for(conn, calendar_url: str) -> str:
     row = conn.execute("SELECT account FROM calendars WHERE url=?", (calendar_url,)).fetchone()
     if not row or not row[0]:
-        raise Failure("not-found", "that calendar is not one omarcal knows")
+        raise Failure("not-found", "that calendar is not one orchard knows")
     return row[0]
 
 
@@ -4509,7 +4571,7 @@ def pick_file(timeout_s: int = 600, *, title: str = "Attach a file",
         bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
     except Exception as error:
         raise Failure("picker", f"no session bus for the file picker ({error})")
-    token = "omarcal" + uuid.uuid4().hex
+    token = "orchard" + uuid.uuid4().hex
     sender = bus.get_unique_name()[1:].replace(".", "_")
     handle = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
     answer = {}
@@ -4606,7 +4668,7 @@ PLACE_PROVIDERS = {
     "nominatim": "https://nominatim.openstreetmap.org/search"
                  "?format=jsonv2&addressdetails=1&limit=5&q=",
 }
-PLACES_AGENT = "omarcal (+https://github.com/kabucey/omarchy-omarcal)"
+PLACES_AGENT = "orchard (+https://github.com/kabucey/omarchy-orchard)"
 PLACES_TIMEOUT = 8.0
 
 
@@ -4739,8 +4801,8 @@ def contact_list(conn) -> dict:
 # deadline, and the answer is capped before it is buffered — refused on its
 # declared length, and again on what actually arrives.
 
-RELEASES_API = "https://api.github.com/repos/kabucey/omarchy-omarcal/releases/latest"
-RELEASES_AGENT = "omarcal (+https://github.com/kabucey/omarchy-omarcal)"
+RELEASES_API = "https://api.github.com/repos/kabucey/omarchy-orchard/releases/latest"
+RELEASES_AGENT = "orchard (+https://github.com/kabucey/omarchy-orchard)"
 UPDATE_TIMEOUT = 10.0          # seconds, for connecting and for each read
 UPDATE_DEADLINE = 20.0         # seconds, for the whole exchange
 UPDATE_MAX_BYTES = 256 * 1024  # a release answer is a few KB
@@ -4789,7 +4851,7 @@ def parse_when(value: str) -> datetime:
 
 
 def main(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="omarcal-helper")
+    ap = argparse.ArgumentParser(prog="orchard-helper")
     ap.add_argument("command", choices=[
         "login", "reveal-password", "accounts", "remove-account",
         "calendars", "set-calendar", "forget-calendar", "sync",
@@ -4798,7 +4860,7 @@ def main(argv: list[str]) -> int:
         "save", "delete", "pick-file", "import-google-client", "zones", "flush", "pending-dismiss",
         "update-check",
     ])
-    ap.add_argument("--user", default=os.environ.get("OMARCAL_USER", ""))
+    ap.add_argument("--user", default=os.environ.get("ORCHARD_USER", ""))
     ap.add_argument("--account-id", default="")
     ap.add_argument("--provider", choices=["icloud", "google", "caldav", "webcal"], default="")
     ap.add_argument("--server", default=ICLOUD)
@@ -4919,7 +4981,7 @@ def _dispatch_unlocked(conn, args) -> dict:
         # One line, not to EOF. A caller that writes the password down a pipe
         # it keeps open — which is what a QML Process does, since it has no
         # way to close stdin — would otherwise leave this blocked forever.
-        password = os.environ.get("OMARCAL_PASSWORD") or sys.stdin.readline().strip("\r\n")
+        password = os.environ.get("ORCHARD_PASSWORD") or sys.stdin.readline().strip("\r\n")
         # No password given means "use the one already held", so an account
         # can be re-checked or its calendars rediscovered without retyping it.
         if not password:
@@ -4932,14 +4994,14 @@ def _dispatch_unlocked(conn, args) -> dict:
         finally:
             session.close()
         previous = stored_password(account_id)
-        if not os.environ.get("OMARCAL_PASSWORD"):
+        if not os.environ.get("ORCHARD_PASSWORD"):
             store_password(account_id, password)
         try:
             conflicts = persist_account(conn, account_id, args.user.strip(), identity,
                                         provider, server, found)
         except Exception:
             conn.rollback()
-            if not os.environ.get("OMARCAL_PASSWORD"):
+            if not os.environ.get("ORCHARD_PASSWORD"):
                 try:
                     if previous:
                         store_password(account_id, previous)

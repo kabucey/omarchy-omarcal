@@ -114,7 +114,7 @@ TestCase {
 
   function test_commands() {
     compare(Logic.updateCommand().join(" "),
-            "omarchy plugin update lancefaul.omarcal --yes")
+            "omarchy plugin update com.buceylabs.orchard --yes")
     compare(Logic.restartCommand().join(" "), "omarchy restart shell")
   }
 }

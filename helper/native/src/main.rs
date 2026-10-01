@@ -142,7 +142,7 @@ fn state_database_path() -> Option<PathBuf> {
         Some(path) => PathBuf::from(path),
         None => PathBuf::from(env::var_os("HOME")?).join(".local/state"),
     };
-    Some(state.join("omarcal").join("cache.db"))
+    Some(state.join("orchard").join("cache.db"))
 }
 
 fn c_string_path(path: &OsStr) -> Option<CString> {
@@ -236,7 +236,7 @@ fn timezone_fingerprint() -> Option<String> {
         })
         .unwrap_or_else(|| tz_value.trim_start_matches(':').to_owned());
 
-    let input = format!("omarcal-alert-tz-v1\0{local_zone}\0{tz_value}\0{localtime_hash}");
+    let input = format!("orchard-alert-tz-v1\0{local_zone}\0{tz_value}\0{localtime_hash}");
     Some(sha256_hex(input.as_bytes()))
 }
 
@@ -1009,13 +1009,13 @@ fn fast_events(args: &[std::ffi::OsString]) -> Option<String> {
 
 fn python_helper_path() -> Option<PathBuf> {
     let executable = env::current_exe().ok()?;
-    Some(executable.parent()?.join("omarcal-helper"))
+    Some(executable.parent()?.join("orchard-helper"))
 }
 
 fn exec_python(args: &[std::ffi::OsString]) -> ! {
     let helper = python_helper_path();
     let Some(helper) = helper else {
-        eprintln!("omarcal-native: cannot locate the Python helper");
+        eprintln!("orchard-native: cannot locate the Python helper");
         std::process::exit(127);
     };
     let error = Command::new("python3")
@@ -1025,7 +1025,7 @@ fn exec_python(args: &[std::ffi::OsString]) -> ! {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .exec();
-    eprintln!("omarcal-native: could not exec Python helper: {error}");
+    eprintln!("orchard-native: could not exec Python helper: {error}");
     std::process::exit(127);
 }
 

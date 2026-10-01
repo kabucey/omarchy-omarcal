@@ -13,7 +13,7 @@ from xml.etree import ElementTree as ET
 
 sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
-HELPER = os.path.join(HERE, "..", "..", "helper", "omarcal-helper")
+HELPER = os.path.join(HERE, "..", "..", "helper", "orchard-helper")
 
 # Sync itself does not need libical. Load the production helper with a tiny
 # import-only stub so these transport tests can run when ICalGLib is absent;
@@ -29,8 +29,8 @@ saved_modules = {name: sys.modules.get(name) for name in ("gi", "gi.repository")
 sys.modules["gi"] = fake_gi
 sys.modules["gi.repository"] = fake_repository
 try:
-    _loader = importlib.machinery.SourceFileLoader("omarcal_helper_sync", HELPER)
-    _spec = importlib.util.spec_from_loader("omarcal_helper_sync", _loader)
+    _loader = importlib.machinery.SourceFileLoader("orchard_helper_sync", HELPER)
+    _spec = importlib.util.spec_from_loader("orchard_helper_sync", _loader)
     helper = importlib.util.module_from_spec(_spec)
     _loader.exec_module(helper)
 finally:

@@ -1,4 +1,4 @@
-# omarcal — plan
+# orchard — plan
 
 A CalDAV calendar widget for the Omarchy shell that talks to the server
 directly instead of going through Evolution Data Server.
@@ -43,7 +43,7 @@ rather than showing the two calendars that were fine.
 ## Architecture
 
 ```
-BarWidget.qml  ──▶  Service.qml  ──▶  helper/omarcal-helper  ──▶  iCloud
+BarWidget.qml  ──▶  Service.qml  ──▶  helper/orchard-helper  ──▶  iCloud
    clock            IPC, polling        CalDAV over HTTP         CalDAV
                                         libical for parsing
                                         SQLite cache
@@ -68,7 +68,7 @@ Three deliberate choices:
 
 ## What is built
 
-`helper/omarcal-helper` — the complete read backend. Every command prints one
+`helper/orchard-helper` — the complete read backend. Every command prints one
 JSON object and exits 0; failures are reported inside it, so the QML side
 always has something to parse.
 
@@ -102,8 +102,8 @@ batches running in parallel on one bounded pool, the ctag short-circuit that
 skips an unchanged calendar entirely, and the span index that discards
 objects in SQL before parsing.
 
-Credentials live in the login keyring under `org.omarchy.omarcal`, put there
-by `login`. **`login` deliberately does not store when `OMARCAL_PASSWORD` is
+Credentials live in the login keyring under `com.buceylabs.orchard`, put there
+by `login`. **`login` deliberately does not store when `ORCHARD_PASSWORD` is
 set** — that variable exists so testing can borrow a password without writing
 to the keyring, and it means a session spent testing that way leaves the
 plugin with no credential of its own. The symptom is `no stored password for
@@ -111,7 +111,7 @@ plugin with no credential of its own. The symptom is `no stored password for
 the cache and only the sync needs the server:
 
 ```bash
-printf '%s' '<app-specific-password>' | ./helper/omarcal-helper login --user <apple-id>
+printf '%s' '<app-specific-password>' | ./helper/orchard-helper login --user <apple-id>
 ```
 
 ### iCloud quirks already handled
@@ -167,7 +167,7 @@ printf '%s' '<app-specific-password>' | ./helper/omarcal-helper login --user <ap
       events on screen.
 - [x] `Panel.qml` — month view: six-by-seven grid, all-day bars spanning the
       days they cover, timed chips, selected-day list, `[` `]` `t` and arrow
-      keys. A calendar list sits to its left under the title **Omarcal**,
+      keys. A calendar list sits to its left under the title **Orchard**,
       each entry a coloured swatch that toggles that calendar's visibility.
       The list is headed by the provider it comes from (`Logic.providerName`
       maps the server to "iCloud", "Fastmail", … and falls back to the host)
@@ -237,9 +237,8 @@ quickest way to read which is which. The selected day is a matching column on
       muted becomes `#74798c` at exactly 4.50:1.
 - [x] **`defaultView`.** The view survives a restart now: picking Day, Week
       or Month writes it, and the panel seeds itself from it when the first
-      `status` lands. Settings names it "Opens on", which is what it means —
-      and says that the view buttons leave it there, since a setting that
-      changes itself should say so.
+      `status` lands. There is no setting for it: the last view used is the
+      one it opens on.
 
 - [x] **Search.** A magnifier beside the sync button swaps the calendar list
       for a search box and what it finds: matches grouped under the whole
@@ -274,8 +273,8 @@ quickest way to read which is which. The selected day is a matching column on
       than an error, and distinct from "not checked yet", which the line
       under it would otherwise contradict.
 
-      **The repository URL is a guess.** `lancefaul/omarchy-omarcal`, from
-      how omedia's is spelled. One constant in Logic.js if it is wrong.
+      The repository is `kabucey/omarchy-orchard`: one constant in Logic.js
+      and one in the helper.
 
 - [x] **The event viewer.** Click an event in the day panel and the whole
       record opens over the card: when, how it repeats, where, its alerts,
@@ -496,32 +495,15 @@ omedia-controls.
 
 ## Publishing
 
-Two remotes, on purpose.
+Orchard lives at `kabucey/omarchy-orchard`. It began as a fork of
+`lancefaul/omarchy-omarcal`, whose MIT notice stays in LICENSE and whose
+name stays in Settings → About.
 
-- `dev` → `lancefaul/omarcal-dev`, **private**, the full history with every
-  commit as it happened. Day-to-day work goes here.
-- `public` → `lancefaul/omarchy-omarcal`, **public**, a single squashed
-  commit per release on the `public` branch, authored as
-  `lancefaul@users.noreply.github.com`.
-
-The public history is deliberately not the development history. The fixture
-was a real family's month before it was sanitised, and an earlier commit of
-it would still be a real family's month; nothing is gained by shipping the
-archaeology and a great deal could be lost.
-
-To publish a release — one new commit per release, on top of the last,
-never an amend and never a force-push: a published release's commit is
-what the marketplace and every installed copy point at, and v1.0.0's
-commit is bound to the marketplace submission.
+To publish a release, bump `version` in manifest.json, then:
 
 ```bash
-git switch refs/heads/public && git checkout master -- .   # master's tree
-GIT_AUTHOR_NAME=lancefaul GIT_AUTHOR_EMAIL=lancefaul@users.noreply.github.com \
-GIT_COMMITTER_NAME=lancefaul GIT_COMMITTER_EMAIL=lancefaul@users.noreply.github.com \
-  git commit -m "omarcal X.Y.Z"
-git push public refs/heads/public:refs/heads/main          # fast-forward
-git tag vX.Y.Z && git push public vX.Y.Z
-gh release create vX.Y.Z -R lancefaul/omarchy-omarcal --target main ...
+git tag vX.Y.Z && git push origin main vX.Y.Z
+gh release create vX.Y.Z -R kabucey/omarchy-orchard --target main ...
 ```
 
 The updater reads GitHub's releases/latest, so a tag without a release is
@@ -543,11 +525,11 @@ fake server would get wrong:
 ```bash
 ./test/all                      # 58 tests, no display needed
 
-export OMARCAL_USER=<apple-id>
-export OMARCAL_PASSWORD=<app-specific-password>
-./helper/omarcal-helper discover --user "$OMARCAL_USER"
-./helper/omarcal-helper sync     --user "$OMARCAL_USER"
-./helper/omarcal-helper events --from 2026-09-01T00:00:00Z --to 2026-10-01T00:00:00Z
+export ORCHARD_USER=<apple-id>
+export ORCHARD_PASSWORD=<app-specific-password>
+./helper/orchard-helper discover --user "$ORCHARD_USER"
+./helper/orchard-helper sync     --user "$ORCHARD_USER"
+./helper/orchard-helper events --from 2026-09-01T00:00:00Z --to 2026-10-01T00:00:00Z
 ```
 
 An app-specific password is generated at account.apple.com → Sign-In and

@@ -1,4 +1,4 @@
-# omarcal
+# Orchard
 
 A CalDAV calendar for the Omarchy shell: a clock in the bar, and a month,
 week and day view behind it.
@@ -55,7 +55,7 @@ credentials stay in the desktop keyring.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/kabucey/omarchy-omarcal.git --enable
+omarchy plugin add https://github.com/kabucey/omarchy-orchard.git --enable
 ```
 
 For local development, link the checkout into the plugins directory instead,
@@ -63,7 +63,7 @@ so edits apply without reinstalling:
 
 ```bash
 # from the root of your checkout
-ln -s "$PWD" ~/.config/omarchy/plugins/lancefaul.omarcal
+ln -s "$PWD" ~/.config/omarchy/plugins/com.buceylabs.orchard
 omarchy-shell shell rescanPlugins
 ```
 
@@ -76,7 +76,7 @@ Apple requires an app-specific password to give a third party access to your
 calendar; your real Apple ID password will not work and is never asked for.
 The form links to the steps, and generates nothing itself.
 
-The password is stored in your keyring under the schema `org.omarchy.omarcal`
+The password is stored in your keyring under the schema `com.buceylabs.orchard`
 and is passed to the helper over stdin, never on a command line — `argv` is
 readable from `/proc` by anything running as your user. Revoking the
 app-specific password from Apple's account page removes this plugin's access
@@ -84,14 +84,14 @@ and nothing else's.
 
 ## Connecting to Google Calendar
 
-Omarcal uses Google's installed-app OAuth flow. Create a Desktop OAuth client
-in your own Google Cloud project; credentials are not bundled with Omarcal.
+Orchard uses Google's installed-app OAuth flow. Create a Desktop OAuth client
+in your own Google Cloud project; credentials are not bundled with Orchard.
 
 1. In the [Google Cloud console](https://console.cloud.google.com/), create or
    select a project. Enable both the
    [Google Calendar API](https://console.cloud.google.com/apis/library/calendar-json.googleapis.com)
    and the [CalDAV API](https://console.cloud.google.com/apis/library/caldav.googleapis.com)
-   in that same project. Omarcal uses the Calendar API to discover calendars
+   in that same project. Orchard uses the Calendar API to discover calendars
    and CalDAV to sync their events.
 2. Open **Google Auth Platform → Branding**. Set an app name, user support
    email, and contact email. Under **Audience**, choose **Internal** if this is
@@ -101,8 +101,8 @@ in your own Google Cloud project; credentials are not bundled with Omarcal.
    Calendar scope `https://www.googleapis.com/auth/calendar`.
 3. Open **Google Auth Platform → Clients → Create client**, choose **Desktop
    app**, create it, and download the JSON file. This is the installed-app
-   client type used by Omarcal's loopback sign-in.
-4. In Omarcal, choose **Add calendar → Google → Import credentials**, select
+   client type used by Orchard's loopback sign-in.
+4. In Orchard, choose **Add calendar → Google → Import credentials**, select
    the downloaded JSON file, then choose **Continue with Google**. Sign in and
    grant access in your browser.
 
@@ -110,20 +110,20 @@ Google's [Calendar quickstart](https://developers.google.com/workspace/calendar/
 [OAuth consent setup guide](https://developers.google.com/workspace/guides/configure-oauth-consent),
 [OAuth client setup guide](https://developers.google.com/workspace/guides/create-credentials),
 and [installed-app OAuth guide](https://developers.google.com/identity/protocols/oauth2/native-app)
-show the corresponding Cloud Console and desktop flow steps. Omarcal requests
+show the corresponding Cloud Console and desktop flow steps. Orchard requests
 the `openid` and `email` identity scopes along with the Calendar scope. While
 an External app remains in **Testing**, Google may expire its refresh tokens
 after seven days because this app requests Calendar access; see Google's
 [OAuth token expiration rules](https://developers.google.com/identity/protocols/oauth2#refresh-token-expiration).
 
 Sign-in opens in your normal browser and returns through a short-lived
-`127.0.0.1` callback protected by PKCE and a random state value. Omarcal stores
+`127.0.0.1` callback protected by PKCE and a random state value. Orchard stores
 only the refresh token in the keyring; access tokens stay in memory.
 
 Google calendars can sync, and existing events can be edited or deleted with
 `If-Match` conflict protection. Creating Google events, managed attachments,
 and “this and following” series splits are intentionally unavailable for now:
-Google's CalDAV API does not support the conditional-create header Omarcal
+Google's CalDAV API does not support the conditional-create header Orchard
 uses to guarantee that a new resource cannot overwrite one already there.
 
 ## What leaves your computer
@@ -134,7 +134,7 @@ uses to guarantee that a new resource cannot overwrite one already there.
 | Google OAuth and Calendar APIs | when connecting Google and refreshing access | browser authorization, account identity, calendar names, colors, and access roles |
 | iCloud Contacts | only if you allow it in Settings → Contacts | reads names and email addresses to suggest invitees |
 | Photon (komoot) or Nominatim (OpenStreetMap) | only if you choose one in Settings → Address search | the address you are typing |
-| GitHub | once a day, unless turned off in Settings → Updates | a request for omarcal's latest release |
+| GitHub | once a day, unless turned off in Settings → Updates | a request for orchard's latest release |
 
 Contacts and address lookups are off until you choose them, and each asks
 in so many words before anything is read or sent. Turning contacts off
@@ -163,9 +163,13 @@ Everything here ships with Omarchy; none of it comes from pip.
 
 | Path | Holds |
 | --- | --- |
-| `~/.local/state/omarcal/cache.db` | synced events, calendars, accounts, settings, changes waiting to be sent, and — only if you allow it — contact names and addresses |
-| `~/.config/omarcal/google-client.json` | your private Google Desktop OAuth client configuration |
-| keyring, schema `org.omarchy.omarcal` | iCloud app-specific passwords and Google refresh tokens |
+| `~/.local/state/orchard/cache.db` | synced events, calendars, accounts, settings, changes waiting to be sent, and — only if you allow it — contact names and addresses |
+| `~/.config/orchard/google-client.json` | your private Google Desktop OAuth client configuration |
+| keyring, schema `com.buceylabs.orchard` | iCloud app-specific passwords and Google refresh tokens |
+
+An install from before the rename to Orchard keeps its data under
+`omarcal`: the cache and Google client directories are moved across the first
+time Orchard looks for them, and each keyring entry when it is first read.
 
 Removing the plugin leaves both; `Disconnect account` in the account form
 deletes an account's calendars, cached events and stored credential. For
@@ -175,7 +179,7 @@ revocation could not be confirmed.
 ## Remove
 
 ```bash
-omarchy plugin remove lancefaul.omarcal
+omarchy plugin remove com.buceylabs.orchard
 ```
 
 ## Development
@@ -200,6 +204,13 @@ python3 bench/alerts.py --objects 500 --iterations 12
 
 The benchmark checks that both backends return the same alerts and reports
 their median poll time. Its temporary cache is removed when it exits.
+
+## Credits
+
+Orchard began as a fork of [omarcal](https://github.com/lancefaul/omarchy-omarcal)
+by lancefaul, and is used and redistributed under its MIT License. The
+original copyright notice is kept in [LICENSE](LICENSE), and the credit also
+appears in the app under Settings → About.
 
 ## Licence
 

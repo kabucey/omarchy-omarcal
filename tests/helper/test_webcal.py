@@ -9,9 +9,9 @@ import unittest
 from unittest.mock import patch
 
 sys_path = os.path.dirname(os.path.abspath(__file__))
-HELPER = os.path.join(sys_path, "..", "..", "helper", "omarcal-helper")
-_loader = importlib.machinery.SourceFileLoader("omarcal_helper_webcal", HELPER)
-_spec = importlib.util.spec_from_loader("omarcal_helper_webcal", _loader)
+HELPER = os.path.join(sys_path, "..", "..", "helper", "orchard-helper")
+_loader = importlib.machinery.SourceFileLoader("orchard_helper_webcal", HELPER)
+_spec = importlib.util.spec_from_loader("orchard_helper_webcal", _loader)
 helper = importlib.util.module_from_spec(_spec)
 _loader.exec_module(helper)
 

@@ -15,9 +15,9 @@ from datetime import datetime, timezone
 
 sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
-HELPER = os.path.join(HERE, "..", "..", "helper", "omarcal-helper")
-_loader = importlib.machinery.SourceFileLoader("omarcal_helper_read", HELPER)
-_spec = importlib.util.spec_from_loader("omarcal_helper_read", _loader)
+HELPER = os.path.join(HERE, "..", "..", "helper", "orchard-helper")
+_loader = importlib.machinery.SourceFileLoader("orchard_helper_read", HELPER)
+_spec = importlib.util.spec_from_loader("orchard_helper_read", _loader)
 helper = importlib.util.module_from_spec(_spec)
 _loader.exec_module(helper)
 
